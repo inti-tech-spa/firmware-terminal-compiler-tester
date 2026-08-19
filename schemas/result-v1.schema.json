@@ -2,26 +2,58 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://inti.tech/samdebug/schemas/result-v1.schema.json",
   "title": "samdebug finite command result v1",
-  "type": "object",
-  "required": ["schema_version", "ok", "command"],
-  "properties": {
-    "schema_version": { "const": 1 },
-    "ok": { "type": "boolean" },
-    "command": { "type": "string", "minLength": 1 },
-    "data": {},
-    "warnings": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/diagnostic" }
-    },
-    "error": { "$ref": "#/$defs/error" }
-  },
-  "allOf": [
-    {
-      "if": { "properties": { "ok": { "const": false } } },
-      "then": { "required": ["error"] }
-    }
+  "oneOf": [
+    { "$ref": "#/$defs/success" },
+    { "$ref": "#/$defs/failure" }
   ],
   "$defs": {
+    "base": {
+      "type": "object",
+      "required": ["schema_version", "ok", "command", "warnings"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "ok": { "type": "boolean" },
+        "command": { "type": "string", "minLength": 1 },
+        "warnings": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/diagnostic" }
+        }
+      }
+    },
+    "success": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "required": ["data"],
+          "properties": {
+            "schema_version": { "const": 1 },
+            "ok": { "const": true },
+            "command": { "type": "string", "minLength": 1 },
+            "data": {},
+            "warnings": { "type": "array", "items": { "$ref": "#/$defs/diagnostic" } }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "failure": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "required": ["error"],
+          "properties": {
+            "schema_version": { "const": 1 },
+            "ok": { "const": false },
+            "command": { "type": "string", "minLength": 1 },
+            "error": { "$ref": "#/$defs/error" },
+            "warnings": { "type": "array", "items": { "$ref": "#/$defs/diagnostic" } }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
     "diagnostic": {
       "type": "object",
       "required": ["code", "message"],
@@ -29,7 +61,8 @@
         "code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
         "message": { "type": "string" },
         "location": { "type": "string" }
-      }
+      },
+      "additionalProperties": false
     },
     "error": {
       "type": "object",
@@ -39,8 +72,8 @@
         "message": { "type": "string" },
         "exit_code": { "enum": [2, 3, 4, 5, 6, 7, 8, 130] },
         "details": {}
-      }
+      },
+      "additionalProperties": false
     }
   }
 }
-

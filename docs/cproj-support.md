@@ -17,9 +17,15 @@ following hold:
 
 Supported macros are `$(MSBuildProjectName)`, `$(MSBuildProjectDirectory)`, and
 `$(Configuration)`. Windows separators are normalized after macro expansion.
-Microchip Studio installation paths for the Arm toolchain, CMSIS, and SAM4S DFP
-are mapped to audited managed-tool paths. Relative project and ASF paths remain
-relative to the `.cproj` directory.
+The Microchip Studio Arm toolchain path is mapped to the managed Arm toolchain.
+Relative project and ASF paths remain relative to the `.cproj` directory.
+
+Absolute Microchip Studio CMSIS or SAM4S DFP include paths are not mapped to a
+bundled pack. They are omitted with a structured warning only when every header
+used by the imported compilation resolves through a later project-relative
+include path. Otherwise import fails with `MISSING_VENDOR_PACK` and instructs
+the user to add the required vendor files to the project. This matches the v1
+decision not to download or redistribute Microchip packs.
 
 ## Explicit rejection
 
@@ -37,12 +43,12 @@ content found in XML.
 
 ## Non-mutation guarantee
 
-The `.cproj`, `.atsln`, source tree, ASF tree, and Studio `Debug`/`Release`
-directories are never written. Import metadata, normalized plans, objects, and
-artifacts are confined to `.samdebug/`. This permits reopening the unchanged
-project in Microchip Studio.
+The `.cproj`, `.atsln`, source tree, ASF tree, linked external sources, and
+Studio `Debug`/`Release` directories are never written. Import metadata,
+normalized plans, objects, and artifacts are confined to the canonical
+project-local `.samdebug/`. Symlink or canonical-path escapes are rejected.
+This permits reopening the unchanged project in Microchip Studio.
 
 Compatibility evidence compares normalized compile/link inputs and ELF
 properties with the existing `smd-motherboard-v2-firmware` project and its
 known Microchip Studio outputs.
-

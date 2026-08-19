@@ -39,17 +39,52 @@ Any state may transition to `failed` or `cancelling`; both must pass through
 `disconnecting` before returning to `idle`. Target power loss, probe removal,
 OpenOCD exit, and GDB exit are typed events, not generic process failures.
 
-Commands that require a halted target are rejected while running. A reconnect
-creates a new session generation so late asynchronous GDB records cannot mutate
-new session state.
+Each session has a monotonically increasing generation. Starting, reconnecting,
+or selecting a different probe increments it and invalidates authorization,
+pending requests, breakpoints cached only in the target, and late asynchronous
+records from earlier generations.
+
+| Current state | Command/event | Next state | Result |
+| --- | --- | --- | --- |
+| `idle` | `session.start` | `probe_selected` | selection event |
+| `probe_selected` | begin server | `server_starting` | starting event |
+| `server_starting` | OpenOCD ready | `server_ready` | port event |
+| `server_ready` | begin GDB | `gdb_starting` | starting event |
+| `gdb_starting` | GDB connected and halted | `connected`, then `halted` | stopped event |
+| `halted` | continue | `running` | running event |
+| `running` | halt or breakpoint | `halted` | stopped event with reason |
+| `halted` | step/next | `running`, then `halted` | running and stopped events |
+| `halted` | reset-halt | `halted` | reset and stopped events |
+| `running` | reset-halt | `halted` | reset and stopped events |
+| `halted` | authorized firmware load | `halted` | progress and loaded events |
+| any live state | `session.stop` | `disconnecting`, then `idle` | stopped event |
+| `failed` | automatic cleanup | `disconnecting`, then `idle` | session error, then stopped event |
+| any non-idle state | cancellation | `cancelling`, then `disconnecting`, then `idle` | cancelled event |
+
+`session.start` is accepted only in `idle`. Continue is accepted only in
+`halted`; halt only in `running`; step, next, firmware load, stack, variables,
+register, and memory inspection only in `halted`. Session stop and cancellation
+are idempotent. Reset-halt is valid in `halted` or `running`. All other
+command/state pairs fail with `INVALID_SESSION_STATE` and do not change state.
+
+OpenOCD/GDB exit, target power loss, or probe removal moves any live state to
+`failed`. Reconnect is not an implicit transition: cleanup reaches `idle`, then
+the caller issues a new `session.start`, creating a new generation. Cancellation
+during either startup state terminates the partially started children before
+the terminal `cancelled` event.
 
 ## Build flow
 
 The `.cproj` is parsed on every build into a deterministic normalized build
-plan. The plan is written below `.samdebug/` for auditability. Compilation,
+plan. The plan is written below a fixed project-local `.samdebug/` for
+auditability. Compilation,
 assembly, linking, and artifact conversion execute without a shell. Vendor
 files are read-only inputs. Outputs are isolated under
-`.samdebug/build/<configuration>/`.
+`.samdebug/build/<configuration>/`. Configurable build or artifact roots are
+not supported in v1. Before any write, the nearest existing ancestor and final
+destination are canonicalized; a path or symlink escaping the canonical
+`.samdebug` root is rejected. Linked sources outside the project remain
+read-only inputs and never determine an output location.
 
 ATSAM4SD32C builds always include `-mcpu=cortex-m4`, `-mthumb`, and
 `-mfloat-abi=soft`. The imported startup files and linker script remain
@@ -62,4 +97,3 @@ text or a versioned JSON envelope. Persistent agent debugging uses NDJSON over
 stdio. The TUI subscribes to the same session event stream and invokes the same
 commands. TUI and machine interfaces therefore cannot develop independent
 debug behavior.
-

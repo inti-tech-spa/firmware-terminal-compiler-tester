@@ -34,10 +34,15 @@ until these records are complete.
 
 ## Licensing decisions
 
-`samdebug` communicates with GCC, GDB, and OpenOCD as separate executables. No
+`samdebug` is licensed under MIT and communicates with GCC, GDB, and
+OpenOCD as separate executables. No
 GPL code is linked into the Rust process. Redistribution will nevertheless ship
-the complete applicable GPL notices, license texts, and corresponding-source
-offer/source archive required for OpenOCD and GNU toolchain components.
+the complete applicable GPL notices and license texts. For every redistributed
+GPL binary, the same release and download location will provide the exact
+corresponding-source archive and build scripts at no additional charge. The
+project will use this accompanying-source mechanism, not a written source
+offer, and retain the release assets for at least as long as the binary is
+distributed.
 
 Microchip ASF, CMSIS, DFP headers, startup files, linker scripts, and libraries
 are not bundled by default in samdebug. Imported projects may use copies they
@@ -49,6 +54,18 @@ manifest entry and legal approval before implementation.
 Updates occur only through an explicit setup/update command. Managed pinned
 tools are the default. A user may explicitly select system tools, but doctor
 must report the loss of reproducibility and validate minimum capabilities. No
-automatic downgrade occurs. Security revocation is represented by a signed
-application release containing a manifest that marks an artifact revoked.
+automatic downgrade occurs. Version 1 has no remotely mutable manifest. The
+manifest is embedded in the samdebug release and trusted through the signed and
+notarized application artifact. Revocation requires a new signed samdebug
+release whose embedded manifest marks the old artifact revoked; the signing
+identity and notarization evidence are recorded in the release provenance.
 
+## Rust dependency policy
+
+All Rust dependencies are locked in `Cargo.lock`. Allowed dependency licenses
+are Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, ISC, Unicode-3.0, and Zlib.
+MPL-2.0 requires file-level review. GPL, AGPL, LGPL, unlicensed, unknown, or
+noncommercial dependencies are denied unless a later audited architecture and
+legal decision explicitly approves them. `cargo deny check licenses` and
+`cargo audit` are required at each Rust milestone. Release SBOMs use SPDX JSON
+and include Rust crates plus every managed executable and source archive.

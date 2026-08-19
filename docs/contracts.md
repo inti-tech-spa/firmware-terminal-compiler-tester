@@ -61,8 +61,15 @@ unless framing can no longer be trusted.
 `erase`, `flash`, `firmware.load`, memory writes, and raw monitor commands are
 privileged. CLI authorization is exactly `<operation>:<probe-serial>` and is
 compared after probe selection. Agent requests carry the same authorization in
-their payload. A token authorizes one operation only, is never cached, and is
-invalid if the selected probe differs.
+their `payload.authorization` object as `operation` and `probe_serial`. A token
+authorizes one operation only, is consumed before execution, is never cached,
+and is invalid if the selected probe differs.
+
+The TUI displays the operation and detected probe serial, then requires the
+operator to type the exact `<operation>:<probe-serial>` text into a modal. The
+modal clears on cancel, failure, completion, probe change, disconnect, or
+session-generation change. Debug firmware loading uses
+`firmware.load:<probe-serial>` through both TUI and agent interfaces.
 
 There is no generic `--yes`. Read-only inspection never acquires write
 authorization implicitly. Raw monitor commands and memory writes are not in the
@@ -72,8 +79,8 @@ v1 public interface.
 
 `samdebug.toml` schema version 1 contains project kind
 `microchip-studio-cproj`, project path, configuration, fixed device
-`ATSAM4SD32C`, build root, artifact root, managed tool channel, probe kind
+`ATSAM4SD32C`, managed tool channel, probe kind
 `atmel-ice`, transport `swd`, speed in kHz (default 1000), and optional serial.
+Build plans and artifacts always use the fixed project-local `.samdebug` root.
 Unknown keys warn in human mode and appear as structured warnings in machine
 mode. Unknown schema major versions fail.
-
