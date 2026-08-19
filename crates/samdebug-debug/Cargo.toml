@@ -1,0 +1,14 @@
+[package]
+name = "samdebug-debug"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+samdebug-core = { version = "=0.1.0", path = "../samdebug-core" }
+samdebug-tools = { version = "=0.1.0", path = "../samdebug-tools" }
+
+[lints]
+workspace = true

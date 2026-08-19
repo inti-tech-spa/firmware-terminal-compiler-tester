@@ -1,0 +1,23 @@
+[package]
+name = "samdebug"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+clap.workspace = true
+ctrlc.workspace = true
+samdebug-core = { version = "=0.1.0", path = "../samdebug-core" }
+samdebug-tui = { version = "=0.1.0", path = "../samdebug-tui" }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,5 @@
+/target/
+/.samdebug/
+*.log
+.DS_Store
+
