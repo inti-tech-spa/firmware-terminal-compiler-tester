@@ -177,6 +177,10 @@ impl<'a> OpenOcdProgrammer<'a> {
                     error
                 }
             })?;
+            let lower = output_text(&output).to_ascii_lowercase();
+            if output.exit_code != Some(0) && is_probe_transport_failure(&lower) {
+                return classify_output(operation, &selected.serial, &output);
+            }
             if is_port_bind_failure(&output) {
                 if attempt < PORT_BIND_ATTEMPTS {
                     continue;
@@ -508,18 +512,34 @@ fn is_port_bind_failure(output: &CommandOutput) -> bool {
 }
 
 fn is_probe_transport_failure(lower: &str) -> bool {
-    (lower.contains("cmsis-dap")
-        && (lower.contains("not found")
-            || lower.contains("unable to find")
-            || lower.contains("command failed")))
-        || lower.contains("usb is disconnected")
-        || lower.contains("usb read error")
-        || lower.contains("usb write error")
-        || lower.contains("hid read error")
-        || lower.contains("hid write error")
-        || lower.contains("bulk read failed")
-        || lower.contains("bulk write failed")
-        || lower.contains("bulk transfer failed")
+    lower.lines().any(|line| {
+        let cmsis_dap_failure = line.contains("cmsis-dap")
+            && (line.contains("not found")
+                || line.contains("unable to find")
+                || (line.contains("command") && line.contains("failed"))
+                || line.contains("command mismatch")
+                || line.contains("transfer count mismatch")
+                || line.contains("protocol error")
+                || line.contains("interface reset failed"));
+        let command_transport_failure =
+            (line.contains("cmd_") || line.contains("swd_sequence")) && line.contains("failed");
+        cmsis_dap_failure
+            || command_transport_failure
+            || line.contains("usb is disconnected")
+            || line.contains("usb read error")
+            || line.contains("usb write error")
+            || line.contains("usb device discovery failed")
+            || line.contains("hid read error")
+            || line.contains("hid write error")
+            || line.contains("hid read timed out")
+            || line.contains("hid write timed out")
+            || line.contains("hid write returned")
+            || line.contains("libusb_bulk_read error")
+            || line.contains("libusb_bulk_write error")
+            || line.contains("bulk read failed")
+            || line.contains("bulk write failed")
+            || line.contains("bulk transfer failed")
+    })
 }
 
 fn classify_output(
@@ -942,36 +962,6 @@ mod tests {
             ),
             (
                 ProgramOperation::Flash,
-                "Error: unable to find CMSIS-DAP device",
-                "PROBE_DISCONNECTED",
-            ),
-            (
-                ProgramOperation::Flash,
-                "Error: USB is disconnected",
-                "PROBE_DISCONNECTED",
-            ),
-            (
-                ProgramOperation::Erase,
-                "Error: USB read error: LIBUSB_ERROR_NO_DEVICE",
-                "PROBE_DISCONNECTED",
-            ),
-            (
-                ProgramOperation::Flash,
-                "Error: HID read error The device is not connected",
-                "PROBE_DISCONNECTED",
-            ),
-            (
-                ProgramOperation::Flash,
-                "Error: CMSIS-DAP command failed.",
-                "PROBE_DISCONNECTED",
-            ),
-            (
-                ProgramOperation::Flash,
-                "Error: verify failed after USB is disconnected",
-                "PROBE_DISCONNECTED",
-            ),
-            (
-                ProgramOperation::Flash,
                 "Error: target examination failed",
                 "TARGET_UNREACHABLE",
             ),
@@ -997,9 +987,6 @@ mod tests {
             )
             .expect_err("classified error");
             assert_eq!(error.code(), expected);
-            if expected == "PROBE_DISCONNECTED" {
-                assert_eq!(error.exit_code(), 5);
-            }
         }
         let error = classify_output(
             ProgramOperation::Erase,
@@ -1012,6 +999,45 @@ mod tests {
         )
         .expect_err("erase verification");
         assert_eq!(error.code(), "ERASE_VERIFICATION_FAILED");
+    }
+
+    #[test]
+    fn pinned_openocd_transport_vocabulary_maps_to_probe_disconnected() {
+        for log in [
+            "Error: unable to find CMSIS-DAP device",
+            "Error: USB is disconnected",
+            "Error: USB read error: LIBUSB_ERROR_NO_DEVICE",
+            "Error: USB write error: LIBUSB_ERROR_NO_DEVICE",
+            "Error: USB device discovery failed",
+            "Error: HID read error The device is not connected",
+            "Error: HID read timed out",
+            "Error: HID write returned -1",
+            "Error: CMSIS-DAP command failed.",
+            "Error: CMSIS-DAP command CMD_CONNECT failed.",
+            "Error: CMD_DAP_SWJ_CLOCK failed.",
+            "Error: CMD_SWD_Configure failed.",
+            "Error: SWD_Sequence failed.",
+            "Error: CMSIS-DAP command mismatch",
+            "Error: CMSIS-DAP transfer count mismatch",
+            "Error: CMSIS-DAP Protocol Error",
+            "Error: CMSIS-DAP: Interface reset failed",
+            "Error: libusb_bulk_read error -4",
+            "Error: libusb_bulk_write error -4",
+            "Error: verify failed after USB is disconnected",
+        ] {
+            let error = classify_output(
+                ProgramOperation::Flash,
+                "ATML123",
+                &CommandOutput {
+                    exit_code: Some(1),
+                    stdout: Vec::new(),
+                    stderr: log.as_bytes().to_vec(),
+                },
+            )
+            .expect_err("transport error");
+            assert_eq!(error.code(), "PROBE_DISCONNECTED", "{log}");
+            assert_eq!(error.exit_code(), 5, "{log}");
+        }
     }
 
     #[test]
@@ -1070,6 +1096,33 @@ mod tests {
         assert_eq!(error.code(), "LOCAL_PORT_UNAVAILABLE");
         assert_eq!(error.exit_code(), 5);
         assert_eq!(exhausted.calls.lock().expect("calls").len(), 4);
+    }
+
+    #[test]
+    fn probe_transport_failure_precedes_bind_retry() {
+        let (_temp, config) = fixture();
+        let runner = ScriptedRunner {
+            calls: Mutex::new(Vec::new()),
+            outputs: Mutex::new(VecDeque::from([CommandOutput {
+                exit_code: Some(1),
+                stdout: Vec::new(),
+                stderr: b"Error: couldn't bind tcl socket: Address already in use\nError: USB is disconnected\n"
+                    .to_vec(),
+            }])),
+        };
+        let ports = SequentialPorts(Mutex::new(41_000));
+        let error = OpenOcdProgrammer::with_ports(&probes(), &runner, &ports, config)
+            .execute(
+                ProgramOperation::Reset,
+                "ATML123",
+                None,
+                None,
+                &CancellationToken::new(),
+            )
+            .expect_err("transport failure");
+        assert_eq!(error.code(), "PROBE_DISCONNECTED");
+        assert_eq!(error.exit_code(), 5);
+        assert_eq!(runner.calls.lock().expect("calls").len(), 1);
     }
 
     #[test]
