@@ -1,23 +1,22 @@
 //! Owned `OpenOCD` programming and GDB session boundary.
 
+mod debug_server;
+mod gdb_process;
+mod mi;
+mod owned_session;
 mod programming;
+mod session;
 
+pub use mi::{MiListItem, MiRecord, MiResult, MiStreamParser, MiValue};
+pub use owned_session::OwnedDebugSession;
+
+pub use debug_server::{DebugServerPorts, OpenOcdDebugServer};
+pub use gdb_process::{GdbMiConfig, GdbMiProcess};
 pub use programming::{
     FirmwareArtifact, OpenOcdConfig, OpenOcdProgrammer, ProbeListReport, ProbeRecord,
     ProgramOperation, ProgrammingReport, list_probes,
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionState {
-    Idle,
-    ProbeSelected,
-    ServerStarting,
-    ServerReady,
-    GdbStarting,
-    Connected,
-    Halted,
-    Running,
-    Failed,
-    Cancelling,
-    Disconnecting,
-}
+pub use session::{
+    Breakpoint, DebuggerTransport, MemoryBlock, MiCommandOutput, RegisterValue, SessionEngine,
+    SessionEvent, SessionState, StackFrame, Variable,
+};

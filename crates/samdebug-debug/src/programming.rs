@@ -511,7 +511,7 @@ fn is_port_bind_failure(output: &CommandOutput) -> bool {
         || lower.contains("bind failed")
 }
 
-fn is_probe_transport_failure(lower: &str) -> bool {
+pub(crate) fn is_probe_transport_failure(lower: &str) -> bool {
     lower.lines().any(|line| {
         let cmsis_dap_failure = line.contains("cmsis-dap")
             && (line.contains("not found")
