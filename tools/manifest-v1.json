@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "channel": "pinned",
+  "installable": false,
+  "reason": "M2 must publish audited binary records with exact checksums before enabling installation.",
+  "pins": {
+    "arm_gnu_toolchain": {
+      "version": "15.2.Rel1",
+      "target": "darwin-arm64-arm-none-eabi",
+      "upstream": "https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads"
+    },
+    "openocd": {
+      "version": "0.12.0",
+      "upstream_tag": "v0.12.0",
+      "upstream_commit_short": "9ea7f3d",
+      "source": "https://github.com/openocd-org/openocd/releases/tag/v0.12.0"
+    }
+  },
+  "artifacts": []
+}
+

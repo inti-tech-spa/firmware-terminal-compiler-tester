@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://inti.tech/samdebug/schemas/result-v1.schema.json",
+  "title": "samdebug finite command result v1",
+  "type": "object",
+  "required": ["schema_version", "ok", "command"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "ok": { "type": "boolean" },
+    "command": { "type": "string", "minLength": 1 },
+    "data": {},
+    "warnings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/diagnostic" }
+    },
+    "error": { "$ref": "#/$defs/error" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "ok": { "const": false } } },
+      "then": { "required": ["error"] }
+    }
+  ],
+  "$defs": {
+    "diagnostic": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
+        "message": { "type": "string" },
+        "location": { "type": "string" }
+      }
+    },
+    "error": {
+      "type": "object",
+      "required": ["code", "message", "exit_code"],
+      "properties": {
+        "code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
+        "message": { "type": "string" },
+        "exit_code": { "enum": [2, 3, 4, 5, 6, 7, 8, 130] },
+        "details": {}
+      }
+    }
+  }
+}
+

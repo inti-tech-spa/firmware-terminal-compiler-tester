@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://inti.tech/samdebug/schemas/debug-v1.schema.json",
+  "title": "samdebug NDJSON message v1",
+  "type": "object",
+  "required": ["schema_version", "kind"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "kind": { "enum": ["request", "response", "event"] },
+    "id": { "type": ["string", "integer"] },
+    "operation": { "type": "string" },
+    "event": { "type": "string" },
+    "payload": { "type": "object" },
+    "ok": { "type": "boolean" },
+    "error": { "type": "object" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "const": "request" } } },
+      "then": { "required": ["id", "operation", "payload"] }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "response" } } },
+      "then": { "required": ["id", "operation", "ok"] }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "event" } } },
+      "then": { "required": ["event", "payload"] }
+    }
+  ]
+}
+
