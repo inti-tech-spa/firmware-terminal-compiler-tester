@@ -436,7 +436,24 @@ fn physical_sigint_cancels_openocd_and_releases_probe() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("start physical erase");
-    thread::sleep(Duration::from_secs(1));
+    let openocd_started = (0..300).any(|_| {
+        if Command::new("/usr/bin/pgrep")
+            .args(["-P", &process.id().to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            true
+        } else {
+            thread::sleep(Duration::from_millis(10));
+            false
+        }
+    });
+    assert!(
+        openocd_started,
+        "OpenOCD child reached the cancellable stage"
+    );
     assert!(
         Command::new("/bin/kill")
             .args(["-INT", &process.id().to_string()])

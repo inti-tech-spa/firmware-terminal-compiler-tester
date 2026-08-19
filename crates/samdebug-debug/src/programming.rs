@@ -12,6 +12,7 @@ use samdebug_core::{
 use serde::Serialize;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
+const PORT_BIND_ATTEMPTS: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenOcdConfig {
@@ -151,35 +152,69 @@ impl<'a> OpenOcdProgrammer<'a> {
             ProgramOperation::Flash => Some(validate_elf(elf)?),
             _ => None,
         };
-        let ports = self.ports.reserve()?;
-        let args = build_args(
-            &self.config,
-            &selected.serial,
-            operation,
-            elf.as_deref(),
-            ports,
-        );
-        let output = self.runner.run_cancellable_with_timeout(
-            &CommandSpec {
-                program: self.config.executable.to_string_lossy().into_owned(),
-                args,
-                current_dir: None,
-            },
-            cancellation,
-            self.config.timeout,
-        );
-        let output = output.map_err(|error| {
-            if error.code() == "PROCESS_TIMEOUT" {
-                SamdebugError::new(
+        for attempt in 1..=PORT_BIND_ATTEMPTS {
+            let ports = self.ports.reserve()?;
+            let args = build_args(
+                &self.config,
+                &selected.serial,
+                operation,
+                elf.as_deref(),
+                ports,
+            );
+            let output = self.runner.run_cancellable_with_timeout(
+                &CommandSpec {
+                    program: self.config.executable.to_string_lossy().into_owned(),
+                    args,
+                    current_dir: None,
+                },
+                cancellation,
+                self.config.timeout,
+            );
+            let output = output.map_err(|error| {
+                if error.code() == "PROCESS_TIMEOUT" {
+                    operation_timeout(operation)
+                } else {
+                    error
+                }
+            })?;
+            if is_port_bind_failure(&output) {
+                if attempt < PORT_BIND_ATTEMPTS {
+                    continue;
+                }
+                return Err(SamdebugError::new(
                     ErrorCategory::Connection,
-                    "OPENOCD_START_TIMEOUT",
-                    "OpenOCD did not complete within the bounded timeout",
+                    "LOCAL_PORT_UNAVAILABLE",
+                    format!(
+                        "OpenOCD could not bind fresh loopback ports after {PORT_BIND_ATTEMPTS} attempts"
+                    ),
                 )
-            } else {
-                error
+                .with_details(serde_json::json!({"openocd_log": output_text(&output).trim()})));
             }
-        })?;
-        classify_output(operation, &selected.serial, &output)
+            return classify_output(operation, &selected.serial, &output);
+        }
+        unreachable!("the bounded port-attempt loop always returns")
+    }
+}
+
+fn operation_timeout(operation: ProgramOperation) -> SamdebugError {
+    match operation {
+        ProgramOperation::Erase | ProgramOperation::Flash => SamdebugError::new(
+            ErrorCategory::Programming,
+            if operation == ProgramOperation::Erase {
+                "ERASE_TIMEOUT"
+            } else {
+                "FLASH_TIMEOUT"
+            },
+            format!(
+                "{} timed out; the destructive operation may be partial and target firmware state is unknown",
+                operation.name()
+            ),
+        ),
+        ProgramOperation::Reset | ProgramOperation::Halt => SamdebugError::new(
+            ErrorCategory::Connection,
+            "TARGET_COMMAND_TIMEOUT",
+            format!("{} timed out before OpenOCD completed", operation.name()),
+        ),
     }
 }
 
@@ -452,19 +487,56 @@ fn command_quote(value: &str) -> String {
     quoted
 }
 
+fn output_text(output: &CommandOutput) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+fn is_port_bind_failure(output: &CommandOutput) -> bool {
+    if output.exit_code == Some(0) {
+        return false;
+    }
+    let lower = output_text(output).to_ascii_lowercase();
+    lower.contains("address already in use")
+        || lower.contains("couldn't bind")
+        || lower.contains("cannot bind")
+        || lower.contains("failed to bind")
+        || lower.contains("bind failed")
+}
+
+fn is_probe_transport_failure(lower: &str) -> bool {
+    (lower.contains("cmsis-dap")
+        && (lower.contains("not found")
+            || lower.contains("unable to find")
+            || lower.contains("command failed")))
+        || lower.contains("usb is disconnected")
+        || lower.contains("usb read error")
+        || lower.contains("usb write error")
+        || lower.contains("hid read error")
+        || lower.contains("hid write error")
+        || lower.contains("bulk read failed")
+        || lower.contains("bulk write failed")
+        || lower.contains("bulk transfer failed")
+}
+
 fn classify_output(
     operation: ProgramOperation,
     serial: &str,
     output: &CommandOutput,
 ) -> SamdebugResult<ProgrammingReport> {
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let text = output_text(output);
     let lower = text.to_ascii_lowercase();
     if output.exit_code != Some(0) {
-        let (category, code, message) = if lower.contains("verify")
+        let (category, code, message) = if is_probe_transport_failure(&lower) {
+            (
+                ErrorCategory::Connection,
+                "PROBE_DISCONNECTED",
+                "Atmel-ICE disconnected",
+            )
+        } else if lower.contains("verify")
             && (lower.contains("failed") || lower.contains("mismatch"))
         {
             (
@@ -486,14 +558,6 @@ fn classify_output(
                 ErrorCategory::Connection,
                 "TARGET_LOCKED",
                 "target is locked",
-            )
-        } else if lower.contains("cmsis-dap")
-            && (lower.contains("not found") || lower.contains("unable to find"))
-        {
-            (
-                ErrorCategory::Connection,
-                "PROBE_DISCONNECTED",
-                "Atmel-ICE disconnected",
             )
         } else if lower.contains("unable to connect") || lower.contains("target examination failed")
         {
@@ -569,7 +633,7 @@ fn parse_voltage(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, sync::Mutex};
+    use std::{collections::VecDeque, path::Path, sync::Mutex};
 
     use samdebug_core::{
         SamdebugResult,
@@ -605,6 +669,61 @@ mod tests {
                 tcl: 41_002,
                 telnet: 41_003,
             })
+        }
+    }
+
+    #[derive(Debug)]
+    struct SequentialPorts(Mutex<u16>);
+
+    impl PortProvider for SequentialPorts {
+        fn reserve(&self) -> SamdebugResult<DynamicPorts> {
+            let mut base = self.0.lock().expect("port sequence");
+            let ports = DynamicPorts {
+                gdb: *base,
+                tcl: *base + 1,
+                telnet: *base + 2,
+            };
+            *base += 10;
+            Ok(ports)
+        }
+    }
+
+    #[derive(Debug)]
+    struct ScriptedRunner {
+        calls: Mutex<Vec<CommandSpec>>,
+        outputs: Mutex<VecDeque<CommandOutput>>,
+    }
+
+    impl ProcessRunner for ScriptedRunner {
+        fn run(&self, command: &CommandSpec) -> SamdebugResult<CommandOutput> {
+            self.calls.lock().expect("calls").push(command.clone());
+            Ok(self
+                .outputs
+                .lock()
+                .expect("outputs")
+                .pop_front()
+                .expect("scripted output"))
+        }
+
+        fn spawn(&self, _command: &CommandSpec) -> SamdebugResult<Box<dyn ManagedChild>> {
+            unreachable!()
+        }
+    }
+
+    #[derive(Debug)]
+    struct TimeoutRunner;
+
+    impl ProcessRunner for TimeoutRunner {
+        fn run(&self, _command: &CommandSpec) -> SamdebugResult<CommandOutput> {
+            Err(SamdebugError::new(
+                ErrorCategory::Tool,
+                "PROCESS_TIMEOUT",
+                "finite process timed out",
+            ))
+        }
+
+        fn spawn(&self, _command: &CommandSpec) -> SamdebugResult<Box<dyn ManagedChild>> {
+            unreachable!()
         }
     }
 
@@ -828,6 +947,31 @@ mod tests {
             ),
             (
                 ProgramOperation::Flash,
+                "Error: USB is disconnected",
+                "PROBE_DISCONNECTED",
+            ),
+            (
+                ProgramOperation::Erase,
+                "Error: USB read error: LIBUSB_ERROR_NO_DEVICE",
+                "PROBE_DISCONNECTED",
+            ),
+            (
+                ProgramOperation::Flash,
+                "Error: HID read error The device is not connected",
+                "PROBE_DISCONNECTED",
+            ),
+            (
+                ProgramOperation::Flash,
+                "Error: CMSIS-DAP command failed.",
+                "PROBE_DISCONNECTED",
+            ),
+            (
+                ProgramOperation::Flash,
+                "Error: verify failed after USB is disconnected",
+                "PROBE_DISCONNECTED",
+            ),
+            (
+                ProgramOperation::Flash,
                 "Error: target examination failed",
                 "TARGET_UNREACHABLE",
             ),
@@ -853,6 +997,9 @@ mod tests {
             )
             .expect_err("classified error");
             assert_eq!(error.code(), expected);
+            if expected == "PROBE_DISCONNECTED" {
+                assert_eq!(error.exit_code(), 5);
+            }
         }
         let error = classify_output(
             ProgramOperation::Erase,
@@ -865,6 +1012,110 @@ mod tests {
         )
         .expect_err("erase verification");
         assert_eq!(error.code(), "ERASE_VERIFICATION_FAILED");
+    }
+
+    #[test]
+    fn retries_bind_collisions_with_fresh_ports_and_reports_exhaustion() {
+        let (_temp, config) = fixture();
+        let collision = || CommandOutput {
+            exit_code: Some(1),
+            stdout: Vec::new(),
+            stderr: b"Error: couldn't bind tcl socket: Address already in use\n".to_vec(),
+        };
+        let runner = ScriptedRunner {
+            calls: Mutex::new(Vec::new()),
+            outputs: Mutex::new(VecDeque::from([
+                collision(),
+                CommandOutput {
+                    exit_code: Some(0),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                },
+            ])),
+        };
+        let ports = SequentialPorts(Mutex::new(41_000));
+        OpenOcdProgrammer::with_ports(&probes(), &runner, &ports, config.clone())
+            .execute(
+                ProgramOperation::Reset,
+                "ATML123",
+                None,
+                None,
+                &CancellationToken::new(),
+            )
+            .expect("second allocation succeeds");
+        let calls = runner.calls.lock().expect("calls");
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].args.contains(&"gdb_port 41000".to_owned()));
+        assert!(calls[1].args.contains(&"gdb_port 41010".to_owned()));
+        drop(calls);
+
+        let exhausted = ScriptedRunner {
+            calls: Mutex::new(Vec::new()),
+            outputs: Mutex::new(VecDeque::from([
+                collision(),
+                collision(),
+                collision(),
+                collision(),
+            ])),
+        };
+        let error = OpenOcdProgrammer::with_ports(&probes(), &exhausted, &ports, config)
+            .execute(
+                ProgramOperation::Reset,
+                "ATML123",
+                None,
+                None,
+                &CancellationToken::new(),
+            )
+            .expect_err("collisions exhausted");
+        assert_eq!(error.code(), "LOCAL_PORT_UNAVAILABLE");
+        assert_eq!(error.exit_code(), 5);
+        assert_eq!(exhausted.calls.lock().expect("calls").len(), 4);
+    }
+
+    #[test]
+    fn timeouts_truthfully_distinguish_destructive_and_target_operations() {
+        let (temp, config) = fixture();
+        for (operation, authorization, code, exit_code) in [
+            (
+                ProgramOperation::Erase,
+                Some("erase:ATML123"),
+                "ERASE_TIMEOUT",
+                6,
+            ),
+            (
+                ProgramOperation::Flash,
+                Some("flash:ATML123"),
+                "FLASH_TIMEOUT",
+                6,
+            ),
+            (ProgramOperation::Reset, None, "TARGET_COMMAND_TIMEOUT", 5),
+            (ProgramOperation::Halt, None, "TARGET_COMMAND_TIMEOUT", 5),
+        ] {
+            let build_directory = temp.path().join(".samdebug/build/Debug");
+            fs::create_dir_all(&build_directory).expect("managed build directory");
+            let elf_path = build_directory.join("firmware.elf");
+            fs::write(&elf_path, b"ELF").expect("ELF");
+            let elf = FirmwareArtifact {
+                path: elf_path,
+                build_directory,
+            };
+            let error = OpenOcdProgrammer::with_ports(
+                &probes(),
+                &TimeoutRunner,
+                &FixedPorts,
+                config.clone(),
+            )
+            .execute(
+                operation,
+                "ATML123",
+                authorization,
+                (operation == ProgramOperation::Flash).then_some(&elf),
+                &CancellationToken::new(),
+            )
+            .expect_err("timeout");
+            assert_eq!(error.code(), code);
+            assert_eq!(error.exit_code(), exit_code);
+        }
     }
 
     #[test]

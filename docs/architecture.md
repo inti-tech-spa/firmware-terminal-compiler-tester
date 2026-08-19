@@ -25,8 +25,9 @@ or panic. The cleanup sequence is graceful request, bounded wait, process
 termination, bounded wait, and final forced termination. A PID captured from the
 spawn operation is used; broad process-name killing is forbidden.
 
-OpenOCD binds only to loopback and uses dynamically reserved GDB/TCL/Telnet
-ports. GDB is started with MI2 and no user initialization files. Arguments are
+OpenOCD binds only to loopback and uses dynamically selected GDB/TCL/Telnet
+ports, retrying with a fresh set after a bind collision. GDB is started with MI2
+and no user initialization files. Arguments are
 always passed as argv arrays, never through a shell.
 
 ## Debug state machine
