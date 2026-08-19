@@ -61,15 +61,15 @@ impl MiStreamParser {
 
     pub fn push(&mut self, bytes: &[u8]) -> SamdebugResult<Vec<MiRecord>> {
         self.pending.extend_from_slice(bytes);
-        if self.pending.len() > MAX_MI_RECORD_BYTES && !self.pending.contains(&b'\n') {
-            self.pending.clear();
-            return Err(mi_error(
-                "MI_RECORD_TOO_LARGE",
-                "GDB/MI record exceeds 1 MiB",
-            ));
-        }
         let mut records = Vec::new();
         while let Some(index) = self.pending.iter().position(|byte| *byte == b'\n') {
+            if index > MAX_MI_RECORD_BYTES {
+                self.pending.clear();
+                return Err(mi_error(
+                    "MI_RECORD_TOO_LARGE",
+                    "GDB/MI record exceeds 1 MiB",
+                ));
+            }
             let mut line = self.pending.drain(..=index).collect::<Vec<_>>();
             line.pop();
             if line.last() == Some(&b'\r') {
@@ -81,6 +81,13 @@ impl MiStreamParser {
             let text = std::str::from_utf8(&line)
                 .map_err(|error| mi_error("MI_UTF8_INVALID", error.to_string()))?;
             records.push(parse_record(text)?);
+        }
+        if self.pending.len() > MAX_MI_RECORD_BYTES {
+            self.pending.clear();
+            return Err(mi_error(
+                "MI_RECORD_TOO_LARGE",
+                "GDB/MI record exceeds 1 MiB",
+            ));
         }
         Ok(records)
     }
@@ -401,6 +408,13 @@ mod tests {
                 .push(&vec![b'x'; MAX_MI_RECORD_BYTES + 1])
                 .unwrap_err()
                 .code(),
+            "MI_RECORD_TOO_LARGE"
+        );
+        let mut parser = MiStreamParser::new();
+        let mut complete = vec![b'x'; MAX_MI_RECORD_BYTES + 1];
+        complete.push(b'\n');
+        assert_eq!(
+            parser.push(&complete).unwrap_err().code(),
             "MI_RECORD_TOO_LARGE"
         );
         let mut parser = MiStreamParser::new();

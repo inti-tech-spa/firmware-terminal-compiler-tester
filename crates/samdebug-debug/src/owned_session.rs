@@ -1,8 +1,32 @@
-use std::path::Path;
+use std::{
+    path::Path,
+    process::{Child, Command, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
 
 use samdebug_core::{
     CancellationToken, ErrorCategory, SamdebugError, SamdebugResult, ports::ProbeProvider,
 };
+
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone)]
+pub struct DebugCancellationController {
+    token: CancellationToken,
+    requested: Arc<AtomicBool>,
+}
+
+impl DebugCancellationController {
+    pub fn cancel(&self) {
+        self.requested.store(true, Ordering::SeqCst);
+        self.token.cancel();
+    }
+}
 
 use crate::{
     Breakpoint, FirmwareArtifact, GdbMiConfig, GdbMiProcess, MemoryBlock, OpenOcdConfig,
@@ -15,6 +39,10 @@ pub struct OwnedDebugSession {
     server: OpenOcdDebugServer,
     engine: SessionEngine<GdbMiProcess>,
     openocd_log_offset: usize,
+    pending_events: Vec<SessionEvent>,
+    cancellation: CancellationToken,
+    supervisor: Option<JoinHandle<()>>,
+    user_cancel_requested: Arc<AtomicBool>,
 }
 
 impl OwnedDebugSession {
@@ -26,30 +54,118 @@ impl OwnedDebugSession {
         firmware: &FirmwareArtifact,
         cancellation: &CancellationToken,
     ) -> SamdebugResult<Self> {
+        Self::launch_with_event_sink(
+            probes,
+            openocd,
+            gdb,
+            requested_serial,
+            firmware,
+            cancellation,
+            &mut |_| {},
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_with_event_sink(
+        probes: &dyn ProbeProvider,
+        openocd: &OpenOcdConfig,
+        gdb: &GdbMiConfig,
+        requested_serial: &str,
+        firmware: &FirmwareArtifact,
+        cancellation: &CancellationToken,
+        event_sink: &mut dyn FnMut(&SessionEvent),
+    ) -> SamdebugResult<Self> {
         validate_selected_probe(probes, requested_serial)?;
         let elf = validate_debug_elf(firmware)?;
+        let generation = next_generation()?;
+        let mut pending_events = Vec::new();
+        record_event(
+            &mut pending_events,
+            event_sink,
+            SessionEvent::ProbeSelected {
+                generation,
+                probe_serial: requested_serial.to_owned(),
+            },
+        );
+        record_event(
+            &mut pending_events,
+            event_sink,
+            SessionEvent::State {
+                generation,
+                previous: SessionState::Idle,
+                current: SessionState::ProbeSelected,
+            },
+        );
+        record_event(
+            &mut pending_events,
+            event_sink,
+            SessionEvent::State {
+                generation,
+                previous: SessionState::ProbeSelected,
+                current: SessionState::ServerStarting,
+            },
+        );
+        record_event(
+            &mut pending_events,
+            event_sink,
+            SessionEvent::ServerStarting { generation },
+        );
         let mut server = OpenOcdDebugServer::launch(openocd, requested_serial, cancellation)?;
+        for event in [
+            SessionEvent::State {
+                generation,
+                previous: SessionState::ServerStarting,
+                current: SessionState::ServerReady,
+            },
+            SessionEvent::ServerReady {
+                generation,
+                gdb_port: server.ports().gdb,
+            },
+            SessionEvent::State {
+                generation,
+                previous: SessionState::ServerReady,
+                current: SessionState::GdbStarting,
+            },
+            SessionEvent::GdbStarting { generation },
+        ] {
+            record_event(&mut pending_events, event_sink, event);
+        }
         if cancellation.is_cancelled() {
             let _ = server.stop();
             return Err(interrupted());
         }
-        let process = match GdbMiProcess::launch(gdb) {
+        let process = match GdbMiProcess::launch_cancellable(gdb, cancellation) {
             Ok(process) => process,
             Err(error) => {
                 let _ = server.stop();
                 return Err(error);
             }
         };
-        let mut engine = SessionEngine::new(process);
-        if let Err(error) = engine.start_connected(requested_serial, server.ports().gdb, &elf) {
-            let _ = engine.stop();
+        let supervisor = spawn_supervisor(
+            process.child_handle(),
+            server.child_handle(),
+            cancellation.clone(),
+        );
+        let mut engine =
+            SessionEngine::with_started_lifecycle(process, cancellation.clone(), generation);
+        if let Err(error) = engine.connect_started(requested_serial, server.ports().gdb, &elf) {
+            if error.category() == ErrorCategory::Interrupted {
+                engine.cancel("session.start");
+            } else {
+                engine.fail_and_cleanup(&error);
+            }
             let _ = server.stop();
+            let _ = supervisor.join();
             return Err(error);
         }
         Ok(Self {
             server,
             engine,
             openocd_log_offset: 0,
+            pending_events,
+            cancellation: cancellation.clone(),
+            supervisor: Some(supervisor),
+            user_cancel_requested: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -64,7 +180,10 @@ impl OwnedDebugSession {
     }
 
     pub fn take_events(&mut self) -> Vec<SessionEvent> {
-        let mut events = self.engine.take_events();
+        self.synchronize_transport();
+        self.synchronize_supervisor();
+        let mut events = std::mem::take(&mut self.pending_events);
+        events.extend(self.engine.take_events());
         let log = self.server.log();
         if let Some(text) = log.get(self.openocd_log_offset..)
             && !text.is_empty()
@@ -77,6 +196,14 @@ impl OwnedDebugSession {
         }
         self.openocd_log_offset = log.len();
         events
+    }
+
+    #[must_use]
+    pub fn cancellation_controller(&self) -> DebugCancellationController {
+        DebugCancellationController {
+            token: self.cancellation.clone(),
+            requested: Arc::clone(&self.user_cancel_requested),
+        }
     }
 
     pub fn continue_target(&mut self) -> SamdebugResult<()> {
@@ -136,14 +263,23 @@ impl OwnedDebugSession {
     }
 
     pub fn stop(&mut self) -> SamdebugResult<()> {
+        self.cancellation.cancel();
         let gdb_result = self.engine.stop();
         let server_result = self.server.stop();
+        if let Some(supervisor) = self.supervisor.take() {
+            let _ = supervisor.join();
+        }
         gdb_result.and(server_result)
     }
 
     pub fn cancel(&mut self, operation: &str) {
+        self.user_cancel_requested.store(true, Ordering::SeqCst);
+        self.cancellation.cancel();
         self.engine.cancel(operation);
         let _ = self.server.stop();
+        if let Some(supervisor) = self.supervisor.take() {
+            let _ = supervisor.join();
+        }
     }
 
     #[must_use]
@@ -161,6 +297,7 @@ impl OwnedDebugSession {
             .with_details(serde_json::json!({"cause": cause}));
             self.engine.fail_and_cleanup(&error);
             let _ = self.server.stop();
+            self.join_supervisor();
             return Err(error);
         }
         Ok(())
@@ -170,16 +307,75 @@ impl OwnedDebugSession {
         &mut self,
         operation: impl FnOnce(&mut SessionEngine<GdbMiProcess>) -> SamdebugResult<R>,
     ) -> SamdebugResult<R> {
+        self.poll_transport()?;
         self.alive()?;
         match operation(&mut self.engine) {
             Ok(value) => Ok(value),
+            Err(error) if error.category() == ErrorCategory::Interrupted => {
+                let returned = if self.user_cancel_requested.load(Ordering::SeqCst) {
+                    self.engine.cancel("in_flight");
+                    error
+                } else {
+                    let failure = SamdebugError::new(
+                        ErrorCategory::Debugger,
+                        "DEBUG_TRANSPORT_FAILED",
+                        "debugger supervision interrupted the operation after a child or transport failure",
+                    );
+                    self.engine.fail_and_cleanup(&failure);
+                    failure
+                };
+                let _ = self.server.stop();
+                self.join_supervisor();
+                Err(returned)
+            }
             Err(error) if is_fatal_debug_error(&error) => {
                 self.engine.fail_and_cleanup(&error);
                 let _ = self.server.stop();
+                self.join_supervisor();
                 Err(error)
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn join_supervisor(&mut self) {
+        if let Some(supervisor) = self.supervisor.take() {
+            let _ = supervisor.join();
+        }
+    }
+
+    fn synchronize_supervisor(&mut self) {
+        if !self.cancellation.is_cancelled() || self.engine.state() == SessionState::Idle {
+            return;
+        }
+        if self.user_cancel_requested.load(Ordering::SeqCst) {
+            self.engine.cancel("external");
+        } else {
+            let cause = self.server.check_alive().err().unwrap_or_else(|| {
+                SamdebugError::new(
+                    ErrorCategory::Debugger,
+                    "DEBUG_TRANSPORT_FAILED",
+                    "a supervised debugger child or transport failed",
+                )
+            });
+            self.engine.fail_and_cleanup(&cause);
+        }
+        let _ = self.server.stop();
+        self.join_supervisor();
+    }
+
+    fn poll_transport(&mut self) -> SamdebugResult<()> {
+        if let Err(error) = self.engine.poll() {
+            self.engine.fail_and_cleanup(&error);
+            let _ = self.server.stop();
+            self.join_supervisor();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn synchronize_transport(&mut self) {
+        let _ = self.poll_transport();
     }
 }
 
@@ -270,6 +466,29 @@ fn interrupted() -> SamdebugError {
     )
 }
 
+fn record_event(
+    pending: &mut Vec<SessionEvent>,
+    sink: &mut dyn FnMut(&SessionEvent),
+    event: SessionEvent,
+) {
+    sink(&event);
+    pending.push(event);
+}
+
+fn next_generation() -> SamdebugResult<u64> {
+    NEXT_GENERATION
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| {
+            SamdebugError::new(
+                ErrorCategory::Debugger,
+                "SESSION_GENERATION_EXHAUSTED",
+                "debug session generation counter is exhausted",
+            )
+        })
+}
+
 fn is_fatal_debug_error(error: &SamdebugError) -> bool {
     matches!(
         error.code(),
@@ -278,5 +497,128 @@ fn is_fatal_debug_error(error: &SamdebugError) -> bool {
             | "GDB_WRITE_FAILED"
             | "GDB_COMMAND_TIMEOUT"
             | "GDB_STOP_TIMEOUT"
+            | "GDB_TARGET_DISCONNECTED"
+            | "MI_RECORD_INVALID"
+            | "MI_RECORD_TOO_LARGE"
+            | "MI_RECORD_TRUNCATED"
+            | "MI_UTF8_INVALID"
     )
+}
+
+fn spawn_supervisor(
+    gdb: Arc<Mutex<Child>>,
+    openocd: Arc<Mutex<Child>>,
+    cancellation: CancellationToken,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        loop {
+            if cancellation.is_cancelled() {
+                terminate_and_reap(&gdb);
+                terminate_and_reap(&openocd);
+                break;
+            }
+            let gdb_exited = child_exited(&gdb);
+            let openocd_exited = child_exited(&openocd);
+            if gdb_exited || openocd_exited {
+                cancellation.cancel();
+                terminate_and_reap(&gdb);
+                terminate_and_reap(&openocd);
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    })
+}
+
+fn child_exited(child: &Arc<Mutex<Child>>) -> bool {
+    child
+        .lock()
+        .expect("supervised child mutex poisoned")
+        .try_wait()
+        .is_ok_and(|status| status.is_some())
+}
+
+fn terminate_and_reap(child: &Arc<Mutex<Child>>) {
+    let mut child = child.lock().expect("supervised child mutex poisoned");
+    if child.try_wait().is_ok_and(|status| status.is_some()) {
+        return;
+    }
+    let pid = child.id();
+    signal_group(pid, "-TERM");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if child.try_wait().is_ok_and(|status| status.is_some()) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    signal_group(pid, "-KILL");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn signal_group(pid: u32, signal: &str) {
+    let _ = Command::new("/bin/kill")
+        .args([signal, &format!("-{pid}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(unix))]
+fn signal_group(_pid: u32, _signal: &str) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generations_are_monotonic_above_individual_sessions() {
+        let first = next_generation().expect("generation");
+        let second = next_generation().expect("generation");
+        assert_eq!(second, first + 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn supervisor_reaps_both_groups_on_cancel_or_peer_exit() {
+        let cancellation = CancellationToken::new();
+        let gdb = spawn_group("/bin/sleep 30");
+        let openocd = spawn_group("/bin/sleep 30");
+        let supervisor =
+            spawn_supervisor(Arc::clone(&gdb), Arc::clone(&openocd), cancellation.clone());
+        cancellation.cancel();
+        supervisor.join().expect("supervisor");
+        assert!(child_exited(&gdb));
+        assert!(child_exited(&openocd));
+
+        let cancellation = CancellationToken::new();
+        let gdb = spawn_group("exit 0");
+        let openocd = spawn_group("/bin/sleep 30");
+        let supervisor =
+            spawn_supervisor(Arc::clone(&gdb), Arc::clone(&openocd), cancellation.clone());
+        supervisor.join().expect("supervisor");
+        assert!(cancellation.is_cancelled());
+        assert!(child_exited(&gdb));
+        assert!(child_exited(&openocd));
+    }
+
+    #[cfg(unix)]
+    fn spawn_group(script: &str) -> Arc<Mutex<Child>> {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        Arc::new(Mutex::new(command.spawn().expect("spawn group")))
+    }
 }

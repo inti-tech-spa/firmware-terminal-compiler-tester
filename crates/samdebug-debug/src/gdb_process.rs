@@ -3,12 +3,15 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
-    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
-use samdebug_core::{ErrorCategory, SamdebugError, SamdebugResult};
+use samdebug_core::{CancellationToken, ErrorCategory, SamdebugError, SamdebugResult};
 
 use crate::{DebuggerTransport, MiCommandOutput, MiRecord, MiStreamParser};
 
@@ -30,7 +33,7 @@ impl GdbMiConfig {
 
 #[derive(Debug)]
 pub struct GdbMiProcess {
-    child: Child,
+    child: Arc<Mutex<Child>>,
     stdin: Option<ChildStdin>,
     records: Receiver<SamdebugResult<MiRecord>>,
     readers: Vec<JoinHandle<()>>,
@@ -40,6 +43,13 @@ pub struct GdbMiProcess {
 
 impl GdbMiProcess {
     pub fn launch(config: &GdbMiConfig) -> SamdebugResult<Self> {
+        Self::launch_cancellable(config, &CancellationToken::new())
+    }
+
+    pub fn launch_cancellable(
+        config: &GdbMiConfig,
+        cancellation: &CancellationToken,
+    ) -> SamdebugResult<Self> {
         validate_config(config)?;
         let mut command = Command::new(&config.executable);
         command
@@ -68,10 +78,12 @@ impl GdbMiProcess {
             .ok_or_else(|| debug_error("GDB_START_FAILED", "GDB standard error was not piped"))?;
         let (sender, records) = mpsc::channel();
         let stdout_sender = sender.clone();
-        let stdout_reader = thread::spawn(move || read_stdout(stdout, &stdout_sender));
+        let reader_cancellation = cancellation.clone();
+        let stdout_reader =
+            thread::spawn(move || read_stdout(stdout, &stdout_sender, &reader_cancellation));
         let stderr_reader = thread::spawn(move || read_stderr(stderr, &sender));
         Ok(Self {
-            child,
+            child: Arc::new(Mutex::new(child)),
             stdin: Some(stdin),
             records,
             readers: vec![stdout_reader, stderr_reader],
@@ -101,24 +113,54 @@ impl GdbMiProcess {
             return Ok(());
         }
         self.stdin.take();
-        if wait_child(&mut self.child, Duration::from_millis(500))? {
+        let mut child = self.child.lock().expect("GDB child mutex poisoned");
+        if wait_child(&mut child, Duration::from_millis(500))? {
+            drop(child);
             self.finish_readers();
             self.stopped = true;
             return Ok(());
         }
-        terminate_process_group(self.child.id());
-        if !wait_child(&mut self.child, Duration::from_secs(1))? {
-            kill_process_group(self.child.id());
-            self.child
+        terminate_process_group(child.id());
+        if !wait_child(&mut child, Duration::from_secs(1))? {
+            kill_process_group(child.id());
+            child
                 .kill()
                 .map_err(|error| debug_error("GDB_KILL_FAILED", error.to_string()))?;
-            self.child
+            child
                 .wait()
                 .map_err(|error| debug_error("GDB_WAIT_FAILED", error.to_string()))?;
         }
+        drop(child);
         self.finish_readers();
         self.stopped = true;
         Ok(())
+    }
+
+    #[must_use]
+    pub(crate) fn child_handle(&self) -> Arc<Mutex<Child>> {
+        Arc::clone(&self.child)
+    }
+
+    fn drain_pending(&self) -> SamdebugResult<Vec<MiRecord>> {
+        let mut records = Vec::new();
+        loop {
+            match self.records.try_recv() {
+                Ok(record) => {
+                    let record = record?;
+                    if is_target_disconnect_record(&record) {
+                        return Err(debug_error(
+                            "GDB_TARGET_DISCONNECTED",
+                            "GDB reported that the remote target connection closed",
+                        ));
+                    }
+                    records.push(record);
+                }
+                Err(TryRecvError::Empty) => return Ok(records),
+                Err(TryRecvError::Disconnected) => {
+                    return Err(debug_error("GDB_EXITED", "GDB output closed"));
+                }
+            }
+        }
     }
 
     fn finish_readers(&mut self) {
@@ -134,10 +176,15 @@ impl DebuggerTransport for GdbMiProcess {
         command: &str,
         wait_for_stop: bool,
         timeout: Duration,
+        cancellation: &CancellationToken,
     ) -> SamdebugResult<MiCommandOutput> {
         if self.stopped {
             return Err(debug_error("GDB_EXITED", "GDB has exited"));
         }
+        if cancellation.is_cancelled() {
+            return Err(interrupted());
+        }
+        let mut records = self.drain_pending()?;
         self.token = self
             .token
             .checked_add(1)
@@ -145,10 +192,14 @@ impl DebuggerTransport for GdbMiProcess {
         let token = self.token;
         self.write_command(token, command)?;
         let deadline = Instant::now() + timeout;
-        let mut records = Vec::new();
         let mut result = None;
         let mut stopped = !wait_for_stop;
+        let mut stopped_after_command = false;
         while result.is_none() || !stopped {
+            if cancellation.is_cancelled() {
+                let _ = self.drain_pending()?;
+                return Err(interrupted());
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(debug_error(
@@ -156,18 +207,22 @@ impl DebuggerTransport for GdbMiProcess {
                     format!("GDB/MI command timed out: {command}"),
                 ));
             }
-            let record = match self.records.recv_timeout(remaining) {
+            let record = match self
+                .records
+                .recv_timeout(remaining.min(Duration::from_millis(10)))
+            {
                 Ok(record) => record?,
-                Err(RecvTimeoutError::Timeout) => {
-                    return Err(debug_error(
-                        "GDB_COMMAND_TIMEOUT",
-                        format!("GDB/MI command timed out: {command}"),
-                    ));
-                }
+                Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => {
                     return Err(debug_error("GDB_EXITED", "GDB output closed"));
                 }
             };
+            if is_target_disconnect_record(&record) {
+                return Err(debug_error(
+                    "GDB_TARGET_DISCONNECTED",
+                    "GDB reported that the remote target connection closed",
+                ));
+            }
             if let MiRecord::Result {
                 token: Some(record_token),
                 class,
@@ -177,8 +232,11 @@ impl DebuggerTransport for GdbMiProcess {
             {
                 result = Some((class.clone(), results.clone()));
             }
-            if matches!(&record, MiRecord::Exec { class, .. } if class == "stopped") {
+            if result.is_some()
+                && matches!(&record, MiRecord::Exec { class, .. } if class == "stopped")
+            {
                 stopped = true;
+                stopped_after_command = true;
             }
             records.push(record);
         }
@@ -187,6 +245,7 @@ impl DebuggerTransport for GdbMiProcess {
             result_class,
             results,
             records,
+            stopped_after_command,
         })
     }
 
@@ -200,10 +259,18 @@ impl DebuggerTransport for GdbMiProcess {
         self.terminate_and_reap()
     }
 
-    fn wait_for_stop(&mut self, timeout: Duration) -> SamdebugResult<Vec<MiRecord>> {
+    fn wait_for_stop(
+        &mut self,
+        timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> SamdebugResult<Vec<MiRecord>> {
         let deadline = Instant::now() + timeout;
         let mut records = Vec::new();
         loop {
+            if cancellation.is_cancelled() {
+                let _ = self.drain_pending()?;
+                return Err(interrupted());
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(debug_error(
@@ -211,24 +278,32 @@ impl DebuggerTransport for GdbMiProcess {
                     "target did not stop within the bounded timeout",
                 ));
             }
-            let record = match self.records.recv_timeout(remaining) {
+            let record = match self
+                .records
+                .recv_timeout(remaining.min(Duration::from_millis(10)))
+            {
                 Ok(record) => record?,
-                Err(RecvTimeoutError::Timeout) => {
-                    return Err(debug_error(
-                        "GDB_STOP_TIMEOUT",
-                        "target did not stop within the bounded timeout",
-                    ));
-                }
+                Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => {
                     return Err(debug_error("GDB_EXITED", "GDB output closed"));
                 }
             };
+            if is_target_disconnect_record(&record) {
+                return Err(debug_error(
+                    "GDB_TARGET_DISCONNECTED",
+                    "GDB reported that the remote target connection closed",
+                ));
+            }
             let stopped = matches!(&record, MiRecord::Exec { class, .. } if class == "stopped");
             records.push(record);
             if stopped {
                 return Ok(records);
             }
         }
+    }
+
+    fn poll_records(&mut self) -> SamdebugResult<Vec<MiRecord>> {
+        self.drain_pending()
     }
 }
 
@@ -269,7 +344,11 @@ fn validate_directory(directory: &Path) -> SamdebugResult<()> {
     }
 }
 
-fn read_stdout(mut stdout: impl Read, sender: &Sender<SamdebugResult<MiRecord>>) {
+fn read_stdout(
+    mut stdout: impl Read,
+    sender: &Sender<SamdebugResult<MiRecord>>,
+    cancellation: &CancellationToken,
+) {
     let mut parser = MiStreamParser::new();
     let mut buffer = [0_u8; 4096];
     loop {
@@ -290,11 +369,13 @@ fn read_stdout(mut stdout: impl Read, sender: &Sender<SamdebugResult<MiRecord>>)
                 }
                 Err(error) => {
                     let _ = sender.send(Err(error));
+                    cancellation.cancel();
                     return;
                 }
             },
             Err(error) => {
                 let _ = sender.send(Err(debug_error("GDB_READ_FAILED", error.to_string())));
+                cancellation.cancel();
                 return;
             }
         }
@@ -373,6 +454,25 @@ fn debug_error(code: &str, message: impl Into<String>) -> SamdebugError {
     SamdebugError::new(ErrorCategory::Debugger, code, message)
 }
 
+fn interrupted() -> SamdebugError {
+    SamdebugError::new(
+        ErrorCategory::Interrupted,
+        "INTERRUPTED",
+        "debug operation interrupted",
+    )
+}
+
+fn is_target_disconnect_record(record: &MiRecord) -> bool {
+    matches!(
+        record,
+        MiRecord::Notify { class, .. }
+            if matches!(
+                class.as_str(),
+                "thread-group-exited" | "connection-removed"
+            )
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
@@ -393,13 +493,23 @@ mod tests {
         let mut process = GdbMiProcess::launch(&GdbMiConfig::new(script)).expect("launch");
         assert_eq!(
             process
-                .command("-exec-step\n-gdb-exit", true, Duration::from_secs(2))
+                .command(
+                    "-exec-step\n-gdb-exit",
+                    true,
+                    Duration::from_secs(2),
+                    &CancellationToken::new(),
+                )
                 .unwrap_err()
                 .code(),
             "GDB_COMMAND_INVALID"
         );
         let output = process
-            .command("-exec-step", true, Duration::from_secs(2))
+            .command(
+                "-exec-step",
+                true,
+                Duration::from_secs(2),
+                &CancellationToken::new(),
+            )
             .expect("command");
         assert_eq!(output.result_class, "done");
         assert!(
@@ -410,6 +520,38 @@ mod tests {
         );
         process.shutdown().expect("shutdown");
         assert!(process.stopped);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stale_stop_before_command_cannot_complete_the_new_operation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script = temp.path().join("stale-stop-gdb");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '*stopped,reason=\"signal-received\"\\n(gdb)\\n'\nwhile IFS= read -r line; do\n token=${line%%-*}\n case \"$line\" in\n *-gdb-exit) printf '%s^exit\\n' \"$token\"; exit 0 ;;\n *) printf '%s^running\\n' \"$token\" ;;\n esac\ndone\n",
+        )
+        .expect("script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("executable");
+        let mut process = GdbMiProcess::launch(&GdbMiConfig::new(script)).expect("launch");
+        thread::sleep(Duration::from_millis(30));
+        let output = process
+            .command(
+                "-exec-continue",
+                false,
+                Duration::from_secs(2),
+                &CancellationToken::new(),
+            )
+            .expect("command");
+        assert_eq!(output.result_class, "running");
+        assert!(!output.stopped_after_command);
+        assert!(
+            output
+                .records
+                .iter()
+                .any(|record| matches!(record, MiRecord::Exec { class, .. } if class == "stopped"))
+        );
+        process.shutdown().expect("shutdown");
     }
 
     #[test]
@@ -452,7 +594,12 @@ mod tests {
         let mut process = GdbMiProcess::launch(&GdbMiConfig::new(crashing)).expect("launch");
         assert_eq!(
             process
-                .command("-exec-step", true, Duration::from_secs(2))
+                .command(
+                    "-exec-step",
+                    true,
+                    Duration::from_secs(2),
+                    &CancellationToken::new(),
+                )
                 .unwrap_err()
                 .code(),
             "GDB_EXITED"
@@ -466,11 +613,16 @@ mod tests {
         )
         .expect("hang script");
         fs::set_permissions(&hanging, fs::Permissions::from_mode(0o755)).expect("executable");
-        let mut process = GdbMiProcess::launch(&GdbMiConfig::new(hanging)).expect("launch");
-        let pid = process.child.id();
+        let mut process = GdbMiProcess::launch(&GdbMiConfig::new(hanging.clone())).expect("launch");
+        let pid = process.child.lock().expect("child").id();
         assert_eq!(
             process
-                .command("-exec-step", true, Duration::from_millis(50))
+                .command(
+                    "-exec-step",
+                    true,
+                    Duration::from_millis(50),
+                    &CancellationToken::new(),
+                )
                 .unwrap_err()
                 .code(),
             "GDB_COMMAND_TIMEOUT"
@@ -485,5 +637,29 @@ mod tests {
                 .expect("probe pid")
                 .success()
         );
+
+        let mut process = GdbMiProcess::launch(&GdbMiConfig::new(hanging)).expect("relaunch");
+        let cancellation = CancellationToken::new();
+        let trigger = cancellation.clone();
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            trigger.cancel();
+        });
+        let started = Instant::now();
+        assert_eq!(
+            process
+                .command(
+                    "-target-download",
+                    false,
+                    Duration::from_secs(2),
+                    &cancellation,
+                )
+                .unwrap_err()
+                .code(),
+            "INTERRUPTED"
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+        canceller.join().expect("canceller");
+        process.shutdown().expect("reap cancelled process");
     }
 }

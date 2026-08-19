@@ -8,7 +8,7 @@ mod programming;
 mod session;
 
 pub use mi::{MiListItem, MiRecord, MiResult, MiStreamParser, MiValue};
-pub use owned_session::OwnedDebugSession;
+pub use owned_session::{DebugCancellationController, OwnedDebugSession};
 
 pub use debug_server::{DebugServerPorts, OpenOcdDebugServer};
 pub use gdb_process::{GdbMiConfig, GdbMiProcess};

@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
-use samdebug_core::{ErrorCategory, SamdebugError, SamdebugResult};
+use samdebug_core::{CancellationToken, ErrorCategory, SamdebugError, SamdebugResult};
 use serde::Serialize;
 
 use crate::{MiListItem, MiRecord, MiResult, MiValue};
@@ -29,6 +29,8 @@ pub struct MiCommandOutput {
     pub result_class: String,
     pub results: Vec<MiResult>,
     pub records: Vec<MiRecord>,
+    /// True only when this command observed a stop record after it was issued.
+    pub stopped_after_command: bool,
 }
 
 pub trait DebuggerTransport: std::fmt::Debug + Send {
@@ -37,8 +39,16 @@ pub trait DebuggerTransport: std::fmt::Debug + Send {
         command: &str,
         wait_for_stop: bool,
         timeout: Duration,
+        cancellation: &CancellationToken,
     ) -> SamdebugResult<MiCommandOutput>;
-    fn wait_for_stop(&mut self, timeout: Duration) -> SamdebugResult<Vec<MiRecord>>;
+    fn wait_for_stop(
+        &mut self,
+        timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> SamdebugResult<Vec<MiRecord>>;
+    fn poll_records(&mut self) -> SamdebugResult<Vec<MiRecord>> {
+        Ok(Vec::new())
+    }
     fn shutdown(&mut self) -> SamdebugResult<()>;
 }
 
@@ -156,17 +166,40 @@ pub struct SessionEngine<T: DebuggerTransport> {
     generation: u64,
     probe_serial: Option<String>,
     events: Vec<SessionEvent>,
+    cancellation: CancellationToken,
 }
 
 impl<T: DebuggerTransport> SessionEngine<T> {
     #[must_use]
-    pub const fn new(transport: T) -> Self {
+    pub fn new(transport: T) -> Self {
+        Self::with_cancellation(transport, CancellationToken::new())
+    }
+
+    #[must_use]
+    pub const fn with_cancellation(transport: T, cancellation: CancellationToken) -> Self {
         Self {
             transport,
             state: SessionState::Idle,
             generation: 0,
             probe_serial: None,
             events: Vec::new(),
+            cancellation,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_started_lifecycle(
+        transport: T,
+        cancellation: CancellationToken,
+        generation: u64,
+    ) -> Self {
+        Self {
+            transport,
+            state: SessionState::GdbStarting,
+            generation,
+            probe_serial: None,
+            events: Vec::new(),
+            cancellation,
         }
     }
 
@@ -182,6 +215,22 @@ impl<T: DebuggerTransport> SessionEngine<T> {
 
     pub fn take_events(&mut self) -> Vec<SessionEvent> {
         std::mem::take(&mut self.events)
+    }
+
+    pub fn poll(&mut self) -> SamdebugResult<()> {
+        if self.state == SessionState::Idle {
+            return Ok(());
+        }
+        let records = self.transport.poll_records()?;
+        self.capture_records(&records);
+        if self.state == SessionState::Running
+            && records
+                .iter()
+                .any(|record| matches!(record, MiRecord::Exec { class, .. } if class == "stopped"))
+        {
+            self.finish_stop(&records, "unknown");
+        }
+        Ok(())
     }
 
     pub fn start_connected(
@@ -217,18 +266,34 @@ impl<T: DebuggerTransport> SessionEngine<T> {
         self.events.push(SessionEvent::GdbStarting {
             generation: self.generation,
         });
+        self.connect_started(probe_serial, gdb_port, Path::new(elf))
+    }
+
+    pub fn connect_started(
+        &mut self,
+        probe_serial: &str,
+        gdb_port: u16,
+        elf: &Path,
+    ) -> SamdebugResult<()> {
+        self.require(&[SessionState::GdbStarting], "session.connect")?;
+        if self.generation == 0 {
+            return Err(debug_error(
+                "SESSION_GENERATION_INVALID",
+                "debug generation must be nonzero",
+            ));
+        }
+        if probe_serial.is_empty() || probe_serial.chars().any(char::is_control) {
+            return Err(debug_error("PROBE_SERIAL_INVALID", "invalid probe serial"));
+        }
+        let elf = elf
+            .to_str()
+            .ok_or_else(|| debug_error("FIRMWARE_PATH_INVALID", "ELF path is not valid UTF-8"))?;
+        self.probe_serial = Some(probe_serial.to_owned());
         self.run_done("-gdb-set mi-async on", false)?;
         self.run_done(&format!("-file-exec-and-symbols {}", mi_quote(elf)), false)?;
         self.run_connected(&format!("-target-select remote 127.0.0.1:{gdb_port}"))?;
         self.transition(SessionState::Connected);
-        let output = self.run_done(
-            &format!(
-                "-interpreter-exec console {}",
-                mi_quote("monitor reset halt")
-            ),
-            false,
-        )?;
-        self.capture_records(&output.records);
+        self.reset_and_confirm_halted()?;
         self.transition(SessionState::Halted);
         self.events.push(SessionEvent::Stopped {
             generation: self.generation,
@@ -241,11 +306,13 @@ impl<T: DebuggerTransport> SessionEngine<T> {
     pub fn continue_target(&mut self) -> SamdebugResult<()> {
         self.require(&[SessionState::Halted], "target.continue")?;
         let output = self.run_running("-exec-continue", false)?;
-        self.capture_records(&output.records);
         self.transition(SessionState::Running);
         self.events.push(SessionEvent::Running {
             generation: self.generation,
         });
+        if output.stopped_after_command {
+            self.finish_stop(&output.records, "unknown");
+        }
         Ok(())
     }
 
@@ -257,7 +324,10 @@ impl<T: DebuggerTransport> SessionEngine<T> {
 
     pub fn wait_until_stopped(&mut self) -> SamdebugResult<Option<StackFrame>> {
         self.require(&[SessionState::Running], "target.wait")?;
-        let records = self.transport.wait_for_stop(COMMAND_TIMEOUT)?;
+        let records = self
+            .transport
+            .wait_for_stop(COMMAND_TIMEOUT, &self.cancellation)?;
+        self.capture_records(&records);
         Ok(self.finish_stop(&records, "unknown"))
     }
 
@@ -276,7 +346,7 @@ impl<T: DebuggerTransport> SessionEngine<T> {
         self.events.push(SessionEvent::Running {
             generation: self.generation,
         });
-        let stopped = if has_stopped(&output.records) {
+        let stopped = if output.stopped_after_command {
             output
         } else {
             self.run_done("-exec-interrupt --all", true)?
@@ -289,14 +359,7 @@ impl<T: DebuggerTransport> SessionEngine<T> {
             &[SessionState::Halted, SessionState::Running],
             "target.reset",
         )?;
-        let output = self.run_done(
-            &format!(
-                "-interpreter-exec console {}",
-                mi_quote("monitor reset halt")
-            ),
-            false,
-        )?;
-        self.capture_records(&output.records);
+        self.reset_and_confirm_halted()?;
         if self.state == SessionState::Running {
             self.transition(SessionState::Halted);
         }
@@ -499,13 +562,7 @@ impl<T: DebuggerTransport> SessionEngine<T> {
                 "GDB compare-sections did not affirmatively verify every firmware section",
             ));
         }
-        self.run_done(
-            &format!(
-                "-interpreter-exec console {}",
-                mi_quote("monitor reset halt")
-            ),
-            false,
-        )?;
+        self.reset_and_confirm_halted()?;
         self.events.push(SessionEvent::Progress {
             generation: self.generation,
             operation: "firmware.load".into(),
@@ -580,7 +637,6 @@ impl<T: DebuggerTransport> SessionEngine<T> {
 
     fn finish_stop(&mut self, records: &[MiRecord], fallback_reason: &str) -> Option<StackFrame> {
         let (reason, frame) = stopped_details(records).unwrap_or((fallback_reason.into(), None));
-        self.capture_records(records);
         self.transition(SessionState::Halted);
         self.events.push(SessionEvent::Stopped {
             generation: self.generation,
@@ -591,9 +647,10 @@ impl<T: DebuggerTransport> SessionEngine<T> {
     }
 
     fn run_done(&mut self, command: &str, wait_for_stop: bool) -> SamdebugResult<MiCommandOutput> {
-        let output = self
-            .transport
-            .command(command, wait_for_stop, COMMAND_TIMEOUT)?;
+        let output =
+            self.transport
+                .command(command, wait_for_stop, COMMAND_TIMEOUT, &self.cancellation)?;
+        self.capture_records(&output.records);
         if output.result_class == "done" || output.result_class == "exit" {
             Ok(output)
         } else {
@@ -602,7 +659,10 @@ impl<T: DebuggerTransport> SessionEngine<T> {
     }
 
     fn run_connected(&mut self, command: &str) -> SamdebugResult<MiCommandOutput> {
-        let output = self.transport.command(command, false, COMMAND_TIMEOUT)?;
+        let output = self
+            .transport
+            .command(command, false, COMMAND_TIMEOUT, &self.cancellation)?;
+        self.capture_records(&output.records);
         if output.result_class == "connected" || output.result_class == "done" {
             Ok(output)
         } else {
@@ -615,9 +675,10 @@ impl<T: DebuggerTransport> SessionEngine<T> {
         command: &str,
         wait_for_stop: bool,
     ) -> SamdebugResult<MiCommandOutput> {
-        let output = self
-            .transport
-            .command(command, wait_for_stop, COMMAND_TIMEOUT)?;
+        let output =
+            self.transport
+                .command(command, wait_for_stop, COMMAND_TIMEOUT, &self.cancellation)?;
+        self.capture_records(&output.records);
         if output.result_class == "running" {
             Ok(output)
         } else {
@@ -644,6 +705,27 @@ impl<T: DebuggerTransport> SessionEngine<T> {
                 self.events.push(event);
             }
         }
+    }
+
+    fn reset_and_confirm_halted(&mut self) -> SamdebugResult<()> {
+        self.run_done(
+            &format!(
+                "-interpreter-exec console {}",
+                mi_quote("monitor reset halt")
+            ),
+            false,
+        )?;
+        let output = self.run_done("-stack-info-frame", false)?;
+        if result(&output.results, "frame")
+            .and_then(as_tuple)
+            .is_none()
+        {
+            return Err(debug_error(
+                "TARGET_HALT_UNCONFIRMED",
+                "GDB did not return a current frame after reset halt",
+            ));
+        }
+        Ok(())
     }
 
     fn require(&self, allowed: &[SessionState], operation: &str) -> SamdebugResult<()> {
@@ -740,12 +822,6 @@ fn parse_address(value: &str) -> Option<u64> {
     u64::from_str_radix(value.strip_prefix("0x").unwrap_or(value), 16).ok()
 }
 
-fn has_stopped(records: &[MiRecord]) -> bool {
-    records
-        .iter()
-        .any(|record| matches!(record, MiRecord::Exec { class, .. } if class == "stopped"))
-}
-
 fn stopped_details(records: &[MiRecord]) -> Option<(String, Option<StackFrame>)> {
     records.iter().find_map(|record| {
         let MiRecord::Exec { class, results } = record else {
@@ -803,9 +879,19 @@ fn mi_quote(value: &str) -> String {
 
 fn command_error(command: &str, output: &MiCommandOutput) -> SamdebugError {
     let message = const_result(&output.results, "msg").unwrap_or("GDB did not provide a message");
+    let lower = message.to_ascii_lowercase();
+    let code = if lower.contains("remote connection closed")
+        || lower.contains("remote communication error")
+        || lower.contains("target disconnected")
+        || lower.contains("not connected")
+    {
+        "GDB_TARGET_DISCONNECTED"
+    } else {
+        "GDB_COMMAND_FAILED"
+    };
     SamdebugError::new(
         ErrorCategory::Debugger,
-        "GDB_COMMAND_FAILED",
+        code,
         format!("GDB/MI command failed: {command}: {message}"),
     )
     .with_details(serde_json::json!({
@@ -828,6 +914,7 @@ mod tests {
     struct FakeTransport {
         commands: Vec<String>,
         outputs: VecDeque<MiCommandOutput>,
+        pending_records: Vec<MiRecord>,
         shutdowns: usize,
     }
 
@@ -836,6 +923,7 @@ mod tests {
             Self {
                 commands: Vec::new(),
                 outputs: outputs.into(),
+                pending_records: Vec::new(),
                 shutdowns: 0,
             }
         }
@@ -847,7 +935,15 @@ mod tests {
             command: &str,
             _wait_for_stop: bool,
             _timeout: Duration,
+            cancellation: &CancellationToken,
         ) -> SamdebugResult<MiCommandOutput> {
+            if cancellation.is_cancelled() {
+                return Err(SamdebugError::new(
+                    ErrorCategory::Interrupted,
+                    "INTERRUPTED",
+                    "debug operation interrupted",
+                ));
+            }
             self.commands.push(command.to_owned());
             self.outputs
                 .pop_front()
@@ -859,7 +955,22 @@ mod tests {
             Ok(())
         }
 
-        fn wait_for_stop(&mut self, _timeout: Duration) -> SamdebugResult<Vec<MiRecord>> {
+        fn poll_records(&mut self) -> SamdebugResult<Vec<MiRecord>> {
+            Ok(std::mem::take(&mut self.pending_records))
+        }
+
+        fn wait_for_stop(
+            &mut self,
+            _timeout: Duration,
+            cancellation: &CancellationToken,
+        ) -> SamdebugResult<Vec<MiRecord>> {
+            if cancellation.is_cancelled() {
+                return Err(SamdebugError::new(
+                    ErrorCategory::Interrupted,
+                    "INTERRUPTED",
+                    "debug operation interrupted",
+                ));
+            }
             Ok(self
                 .outputs
                 .pop_front()
@@ -873,6 +984,7 @@ mod tests {
             result_class: "done".into(),
             results: Vec::new(),
             records: Vec::new(),
+            stopped_after_command: false,
         }
     }
 
@@ -882,10 +994,24 @@ mod tests {
             result_class: "connected".into(),
             results: Vec::new(),
             records: Vec::new(),
+            stopped_after_command: false,
         });
         outputs.push(done());
+        outputs.push(frame_output());
         outputs.extend(extra);
         FakeTransport::scripted(outputs)
+    }
+
+    fn frame_output() -> MiCommandOutput {
+        MiCommandOutput {
+            result_class: "done".into(),
+            results: vec![MiResult {
+                variable: "frame".into(),
+                value: tuple(&[("level", "0"), ("func", "main"), ("addr", "0x00400100")]),
+            }],
+            records: Vec::new(),
+            stopped_after_command: false,
+        }
     }
 
     fn start(engine: &mut SessionEngine<FakeTransport>) {
@@ -903,6 +1029,7 @@ mod tests {
             result_class: "running".into(),
             results: Vec::new(),
             records: Vec::new(),
+            stopped_after_command: false,
         }]));
         assert_eq!(
             engine.continue_target().unwrap_err().code(),
@@ -917,6 +1044,42 @@ mod tests {
         engine.stop().expect("stop");
         assert_eq!(engine.state(), SessionState::Idle);
         assert_eq!(engine.transport.shutdowns, 1);
+    }
+
+    #[test]
+    fn poll_dispatches_idle_streams_and_running_stop_for_current_generation() {
+        let mut engine = SessionEngine::new(started_transport(vec![MiCommandOutput {
+            result_class: "running".into(),
+            results: Vec::new(),
+            records: Vec::new(),
+            stopped_after_command: false,
+        }]));
+        start(&mut engine);
+        engine.continue_target().expect("continue");
+        engine.transport.pending_records = vec![
+            MiRecord::Target("late target output\n".into()),
+            MiRecord::Exec {
+                class: "stopped".into(),
+                results: vec![MiResult {
+                    variable: "reason".into(),
+                    value: MiValue::Const("breakpoint-hit".into()),
+                }],
+            },
+        ];
+        engine.poll().expect("poll");
+        assert_eq!(engine.state(), SessionState::Halted);
+        let generation = engine.generation();
+        let events = engine.take_events();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::TargetOutput { generation: event_generation, text, .. }
+                if *event_generation == generation && text == "late target output\n"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::Stopped { generation: event_generation, reason, .. }
+                if *event_generation == generation && reason == "breakpoint"
+        )));
     }
 
     #[test]
@@ -936,7 +1099,8 @@ mod tests {
                     },
                 ]),
             }],
-            records: Vec::new(),
+            records: vec![MiRecord::Target("query output\n".into())],
+            stopped_after_command: false,
         };
         let stack = list_output(
             "stack",
@@ -974,11 +1138,16 @@ mod tests {
                 records: vec![MiRecord::Console(
                     "Section .text, range 0x400000 -- 0x401000: matched.\n".into(),
                 )],
+                stopped_after_command: false,
             },
             done(),
+            frame_output(),
         ]));
         start(&mut engine);
         assert_eq!(engine.insert_breakpoint("main", false).unwrap().id, "1");
+        assert!(engine.take_events().iter().any(
+            |event| matches!(event, SessionEvent::TargetOutput { text, .. } if text == "query output\n")
+        ));
         assert_eq!(engine.stack_frames(0, 32).unwrap()[0].function, "main");
         assert_eq!(engine.variables(0).unwrap()[0].value, "7");
         assert_eq!(
@@ -1030,6 +1199,7 @@ mod tests {
             records: vec![MiRecord::Console(
                 "Section .text, range 0x400000 -- 0x401000: MIS-MATCHED!\n".into(),
             )],
+            stopped_after_command: false,
         };
         let mut engine = SessionEngine::new(started_transport(vec![done(), mismatch]));
         start(&mut engine);
@@ -1075,6 +1245,7 @@ mod tests {
                 value: MiValue::List(values.into_iter().map(MiListItem::Value).collect()),
             }],
             records: Vec::new(),
+            stopped_after_command: false,
         }
     }
 }

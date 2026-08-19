@@ -23,7 +23,7 @@ pub struct DebugServerPorts {
 
 #[derive(Debug)]
 pub struct OpenOcdDebugServer {
-    child: Child,
+    child: Arc<Mutex<Child>>,
     ports: DebugServerPorts,
     log: Arc<Mutex<String>>,
     readers: Vec<JoinHandle<()>>,
@@ -39,7 +39,7 @@ impl OpenOcdDebugServer {
         validate(config, serial)?;
         for attempt in 1..=STARTUP_ATTEMPTS {
             let ports = select_ports()?;
-            let mut server = Self::spawn(config, serial, ports)?;
+            let mut server = Self::spawn(config, serial, ports, cancellation)?;
             match server.wait_ready(config.timeout, cancellation) {
                 Ok(()) => return Ok(server),
                 Err(error)
@@ -63,6 +63,7 @@ impl OpenOcdDebugServer {
         config: &OpenOcdConfig,
         serial: &str,
         ports: DebugServerPorts,
+        cancellation: &CancellationToken,
     ) -> SamdebugResult<Self> {
         let mut command = Command::new(&config.executable);
         command
@@ -112,11 +113,11 @@ impl OpenOcdDebugServer {
         })?;
         let log = Arc::new(Mutex::new(String::new()));
         let readers = vec![
-            spawn_log_reader(stdout, Arc::clone(&log)),
-            spawn_log_reader(stderr, Arc::clone(&log)),
+            spawn_log_reader(stdout, Arc::clone(&log), cancellation.clone()),
+            spawn_log_reader(stderr, Arc::clone(&log), cancellation.clone()),
         ];
         Ok(Self {
-            child,
+            child: Arc::new(Mutex::new(child)),
             ports,
             log,
             readers,
@@ -144,11 +145,13 @@ impl OpenOcdDebugServer {
             )) {
                 return Ok(());
             }
-            if let Some(status) = self
+            let status = self
                 .child
+                .lock()
+                .expect("OpenOCD child mutex poisoned")
                 .try_wait()
-                .map_err(|error| connection_error("OPENOCD_WAIT_FAILED", error.to_string()))?
-            {
+                .map_err(|error| connection_error("OPENOCD_WAIT_FAILED", error.to_string()))?;
+            if let Some(status) = status {
                 self.finish_readers();
                 let log = self.log();
                 let (code, message) = if is_probe_disconnect(&log) {
@@ -196,11 +199,13 @@ impl OpenOcdDebugServer {
         if self.stopped {
             return Err(connection_error("OPENOCD_EXITED", "OpenOCD is stopped"));
         }
-        if let Some(status) = self
+        let status = self
             .child
+            .lock()
+            .expect("OpenOCD child mutex poisoned")
             .try_wait()
-            .map_err(|error| connection_error("OPENOCD_WAIT_FAILED", error.to_string()))?
-        {
+            .map_err(|error| connection_error("OPENOCD_WAIT_FAILED", error.to_string()))?;
+        if let Some(status) = status {
             self.finish_readers();
             let log = self.log();
             let code = if is_probe_disconnect(&log) {
@@ -221,18 +226,20 @@ impl OpenOcdDebugServer {
         if self.stopped {
             return Ok(());
         }
-        if !wait_child(&mut self.child, Duration::from_millis(100))? {
-            terminate_group(self.child.id());
-            if !wait_child(&mut self.child, Duration::from_secs(1))? {
-                kill_group(self.child.id());
-                self.child
+        let mut child = self.child.lock().expect("OpenOCD child mutex poisoned");
+        if !wait_child(&mut child, Duration::from_millis(100))? {
+            terminate_group(child.id());
+            if !wait_child(&mut child, Duration::from_secs(1))? {
+                kill_group(child.id());
+                child
                     .kill()
                     .map_err(|error| connection_error("OPENOCD_KILL_FAILED", error.to_string()))?;
-                self.child
+                child
                     .wait()
                     .map_err(|error| connection_error("OPENOCD_WAIT_FAILED", error.to_string()))?;
             }
         }
+        drop(child);
         self.finish_readers();
         self.stopped = true;
         Ok(())
@@ -242,6 +249,11 @@ impl OpenOcdDebugServer {
         for reader in self.readers.drain(..) {
             let _ = reader.join();
         }
+    }
+
+    #[must_use]
+    pub(crate) fn child_handle(&self) -> Arc<Mutex<Child>> {
+        Arc::clone(&self.child)
     }
 }
 
@@ -298,9 +310,16 @@ fn validate(config: &OpenOcdConfig, serial: &str) -> SamdebugResult<()> {
     Ok(())
 }
 
-fn spawn_log_reader(stream: impl Read + Send + 'static, log: Arc<Mutex<String>>) -> JoinHandle<()> {
+fn spawn_log_reader(
+    stream: impl Read + Send + 'static,
+    log: Arc<Mutex<String>>,
+    cancellation: CancellationToken,
+) -> JoinHandle<()> {
     thread::spawn(move || {
         for line in BufReader::new(stream).lines().map_while(Result::ok) {
+            if is_probe_disconnect(&line) || is_target_connection_loss(&line) {
+                cancellation.cancel();
+            }
             let mut log = log.lock().expect("OpenOCD log mutex poisoned");
             if log.len() < 1024 * 1024 {
                 log.push_str(&line);
@@ -320,6 +339,13 @@ fn is_bind_failure(log: &str) -> bool {
 fn is_probe_disconnect(log: &str) -> bool {
     let lower = log.to_ascii_lowercase();
     crate::programming::is_probe_transport_failure(&lower)
+}
+
+fn is_target_connection_loss(log: &str) -> bool {
+    let lower = log.to_ascii_lowercase();
+    lower.contains("target voltage") && (lower.contains("low") || lower.contains("0.0"))
+        || lower.contains("target examination failed")
+        || lower.contains("unable to connect to target")
 }
 
 fn tcl_quote(value: &str) -> String {
