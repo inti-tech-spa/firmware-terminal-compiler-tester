@@ -1,4 +1,11 @@
-//! OpenOCD/GDB session boundary. Implemented in milestones M5 and M6.
+//! Owned `OpenOCD` programming and GDB session boundary.
+
+mod programming;
+
+pub use programming::{
+    FirmwareArtifact, OpenOcdConfig, OpenOcdProgrammer, ProbeListReport, ProbeRecord,
+    ProgramOperation, ProgrammingReport, list_probes,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {

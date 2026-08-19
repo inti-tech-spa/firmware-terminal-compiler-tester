@@ -81,6 +81,20 @@ fn doctor_has_stable_json_report() {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
+fn probe_list_has_stable_json_report() {
+    let output = Command::new(env!("CARGO_BIN_EXE_samdebug"))
+        .args(["probe", "list", "--output=json"])
+        .output()
+        .expect("list probes");
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert_eq!(value["command"], "probe");
+    assert!(value["data"]["probes"].is_array());
+}
+
+#[test]
 #[cfg(unix)]
 fn doctor_uses_and_validates_explicit_system_tools() {
     use std::os::unix::fs::PermissionsExt;
@@ -159,22 +173,9 @@ transport = "swd"
 }
 
 #[test]
-fn authorization_is_probe_and_operation_scoped() {
-    let rejected = Command::new(env!("CARGO_BIN_EXE_samdebug"))
-        .args([
-            "flash",
-            "--probe",
-            "ABC",
-            "--confirm",
-            "erase:ABC",
-            "--output",
-            "json",
-        ])
-        .output()
-        .expect("run rejected flash");
-    assert_eq!(rejected.status.code(), Some(8));
-
-    let authorized_but_unimplemented = Command::new(env!("CARGO_BIN_EXE_samdebug"))
+fn programming_commands_require_project_configuration() {
+    let temp = TempDir::new().expect("tempdir");
+    let output = Command::new(env!("CARGO_BIN_EXE_samdebug"))
         .args([
             "flash",
             "--probe",
@@ -184,12 +185,12 @@ fn authorization_is_probe_and_operation_scoped() {
             "--output",
             "json",
         ])
+        .current_dir(temp.path())
         .output()
-        .expect("run accepted flash");
-    assert_eq!(authorized_but_unimplemented.status.code(), Some(6));
-    let value: serde_json::Value =
-        serde_json::from_slice(&authorized_but_unimplemented.stdout).expect("valid json");
-    assert_eq!(value["error"]["code"], "NOT_IMPLEMENTED");
+        .expect("run flash without config");
+    assert_eq!(output.status.code(), Some(2));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
+    assert_eq!(value["error"]["code"], "CONFIG_READ_FAILED");
 }
 
 #[test]
@@ -409,4 +410,54 @@ fn copy_tree(source: &Path, destination: &Path) {
             std::fs::copy(entry.path(), target).expect("copy fixture file");
         }
     }
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "requires a connected Atmel-ICE/ATSAM4SD32C and explicit destructive confirmation"]
+fn physical_sigint_cancels_openocd_and_releases_probe() {
+    let project = std::env::var("SAMDEBUG_PHYSICAL_PROJECT").expect("physical project path");
+    let serial = std::env::var("SAMDEBUG_PHYSICAL_PROBE_SERIAL").expect("probe serial");
+    assert_eq!(
+        std::env::var("SAMDEBUG_PHYSICAL_CONFIRM").expect("physical confirmation"),
+        format!("erase:{serial}")
+    );
+    let process = Command::new(env!("CARGO_BIN_EXE_samdebug"))
+        .args([
+            "erase",
+            "--probe",
+            &serial,
+            "--confirm",
+            &format!("erase:{serial}"),
+            "--output=json",
+        ])
+        .current_dir(&project)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start physical erase");
+    thread::sleep(Duration::from_secs(1));
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-INT", &process.id().to_string()])
+            .status()
+            .expect("interrupt erase")
+            .success()
+    );
+    let output = process
+        .wait_with_output()
+        .expect("wait for interrupted erase");
+    assert_eq!(output.status.code(), Some(130));
+    assert!(output.stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert_eq!(value["error"]["code"], "INTERRUPTED");
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_samdebug"))
+        .args(["doctor", "--output=json"])
+        .current_dir(project)
+        .output()
+        .expect("reacquire probe after cancellation");
+    assert!(doctor.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&doctor.stdout).expect("doctor JSON");
+    assert_eq!(value["data"]["probe"]["target_connectivity"], "connected");
 }

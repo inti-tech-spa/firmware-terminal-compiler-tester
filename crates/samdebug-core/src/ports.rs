@@ -75,5 +75,13 @@ pub trait ProcessRunner: std::fmt::Debug + Send + Sync {
         }
         self.run(command)
     }
+    fn run_cancellable_with_timeout(
+        &self,
+        command: &CommandSpec,
+        cancellation: &CancellationToken,
+        _timeout: Duration,
+    ) -> SamdebugResult<CommandOutput> {
+        self.run_cancellable(command, cancellation)
+    }
     fn spawn(&self, command: &CommandSpec) -> SamdebugResult<Box<dyn ManagedChild>>;
 }

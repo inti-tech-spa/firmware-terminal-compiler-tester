@@ -172,70 +172,99 @@ impl ProcessRunner for SystemProcessRunner {
         command: &CommandSpec,
         cancellation: &CancellationToken,
     ) -> SamdebugResult<CommandOutput> {
+        run_finite(command, cancellation, None)
+    }
+
+    fn run_cancellable_with_timeout(
+        &self,
+        command: &CommandSpec,
+        cancellation: &CancellationToken,
+        timeout: Duration,
+    ) -> SamdebugResult<CommandOutput> {
+        run_finite(command, cancellation, Some(timeout))
+    }
+}
+
+fn run_finite(
+    command: &CommandSpec,
+    cancellation: &CancellationToken,
+    timeout: Option<Duration>,
+) -> SamdebugResult<CommandOutput> {
+    if cancellation.is_cancelled() {
+        return Err(SamdebugError::new(
+            ErrorCategory::Interrupted,
+            "INTERRUPTED",
+            "operation interrupted",
+        ));
+    }
+    let mut process = make_command(command);
+    process
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_finite_process(&mut process);
+    let mut child = process
+        .spawn()
+        .map_err(|error| process_error("PROCESS_RUN_FAILED", &error))?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let stdout_reader = thread::spawn(move || read_pipe(stdout));
+    let stderr_reader = thread::spawn(move || read_pipe(stderr));
+    let deadline = timeout.map(|duration| Instant::now() + duration);
+    let status = loop {
         if cancellation.is_cancelled() {
+            kill_finite_process(&mut child);
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
             return Err(SamdebugError::new(
                 ErrorCategory::Interrupted,
                 "INTERRUPTED",
                 "operation interrupted",
             ));
         }
-        let mut process = make_command(command);
-        process
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        configure_finite_process(&mut process);
-        let mut child = process
-            .spawn()
-            .map_err(|error| process_error("PROCESS_RUN_FAILED", &error))?;
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
-        let stdout_reader = thread::spawn(move || read_pipe(stdout));
-        let stderr_reader = thread::spawn(move || read_pipe(stderr));
-        let status = loop {
-            if cancellation.is_cancelled() {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            kill_finite_process(&mut child);
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(SamdebugError::new(
+                ErrorCategory::Tool,
+                "PROCESS_TIMEOUT",
+                "process exceeded its execution timeout",
+            ));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
                 kill_finite_process(&mut child);
                 let _ = child.wait();
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
-                return Err(SamdebugError::new(
-                    ErrorCategory::Interrupted,
-                    "INTERRUPTED",
-                    "operation interrupted",
-                ));
+                return Err(process_error("PROCESS_WAIT_FAILED", &error));
             }
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) => thread::sleep(Duration::from_millis(10)),
-                Err(error) => {
-                    kill_finite_process(&mut child);
-                    let _ = child.wait();
-                    let _ = stdout_reader.join();
-                    let _ = stderr_reader.join();
-                    return Err(process_error("PROCESS_WAIT_FAILED", &error));
-                }
-            }
-        };
-        let stdout = stdout_reader.join().map_err(|_| {
-            SamdebugError::new(
-                ErrorCategory::Tool,
-                "PROCESS_OUTPUT_FAILED",
-                "stdout reader panicked",
-            )
-        })??;
-        let stderr = stderr_reader.join().map_err(|_| {
-            SamdebugError::new(
-                ErrorCategory::Tool,
-                "PROCESS_OUTPUT_FAILED",
-                "stderr reader panicked",
-            )
-        })??;
-        Ok(CommandOutput {
-            exit_code: status.code(),
-            stdout,
-            stderr,
-        })
-    }
+        }
+    };
+    let stdout = stdout_reader.join().map_err(|_| {
+        SamdebugError::new(
+            ErrorCategory::Tool,
+            "PROCESS_OUTPUT_FAILED",
+            "stdout reader panicked",
+        )
+    })??;
+    let stderr = stderr_reader.join().map_err(|_| {
+        SamdebugError::new(
+            ErrorCategory::Tool,
+            "PROCESS_OUTPUT_FAILED",
+            "stderr reader panicked",
+        )
+    })??;
+    Ok(CommandOutput {
+        exit_code: status.code(),
+        stdout,
+        stderr,
+    })
 }
 
 #[cfg(unix)]
@@ -526,6 +555,24 @@ mod tests {
             .expect_err("cancellation stops process");
         thread.join().expect("signal thread");
         assert_eq!(error.code(), "INTERRUPTED");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn finite_process_timeout_kills_and_reaps_child() {
+        let started = std::time::Instant::now();
+        let error = SystemProcessRunner
+            .run_cancellable_with_timeout(
+                &CommandSpec {
+                    program: "/bin/sleep".into(),
+                    args: vec!["30".into()],
+                    current_dir: None,
+                },
+                &CancellationToken::new(),
+                Duration::from_millis(50),
+            )
+            .expect_err("timeout stops process");
+        assert_eq!(error.code(), "PROCESS_TIMEOUT");
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 

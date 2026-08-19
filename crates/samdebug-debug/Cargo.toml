@@ -9,6 +9,11 @@ rust-version.workspace = true
 [dependencies]
 samdebug-core = { version = "=0.1.0", path = "../samdebug-core" }
 samdebug-tools = { version = "=0.1.0", path = "../samdebug-tools" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

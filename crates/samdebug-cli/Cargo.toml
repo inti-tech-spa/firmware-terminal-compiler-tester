@@ -10,6 +10,7 @@ rust-version.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
 samdebug-core = { version = "=0.1.0", path = "../samdebug-core" }
+samdebug-debug = { version = "=0.1.0", path = "../samdebug-debug" }
 samdebug-project = { version = "=0.1.0", path = "../samdebug-project" }
 samdebug-tools = { version = "=0.1.0", path = "../samdebug-tools" }
 samdebug-tui = { version = "=0.1.0", path = "../samdebug-tui" }

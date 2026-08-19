@@ -6,7 +6,10 @@ use samdebug_core::{
     SamdebugResult,
     ports::{CommandSpec, DownloadReceipt, Downloader, FileSystem, ProcessRunner},
 };
-use samdebug_project::{BuildToolPaths, artifacts, build, clean, initialize_project};
+use samdebug_debug::{
+    FirmwareArtifact, OpenOcdConfig, OpenOcdProgrammer, ProgramOperation, list_probes,
+};
+use samdebug_project::{BuildToolPaths, artifacts, build, clean, import_cproj, initialize_project};
 use samdebug_tools::{
     ChildSupervisor, CurlDownloader, Installer, MacUsbProbeProvider, Platform, SystemProcessRunner,
     ToolManifest, run_doctor, run_system_doctor,
@@ -268,8 +271,18 @@ fn dispatch(
         Command::Debug(args) if !args.agent => samdebug_tui::run()
             .map(|()| ("debug", json!({})))
             .map_err(|error| ("debug", error)),
-        Command::Erase(args) => authorized_reserved_command("erase", args),
-        Command::Flash(args) => authorized_reserved_command("flash", args),
+        Command::Probe {
+            command: ProbeCommand::List,
+        } => list_probes(&MacUsbProbeProvider)
+            .map(|report| {
+                (
+                    "probe",
+                    serde_json::to_value(report).expect("probe report serializes"),
+                )
+            })
+            .map_err(|error| ("probe", error)),
+        Command::Erase(args) => programming_command(ProgramOperation::Erase, args, cancellation),
+        Command::Flash(args) => programming_command(ProgramOperation::Flash, args, cancellation),
         Command::InternalTestBlock => run_internal_blocking_test(cancellation)
             .map(|code| ("__test-block", json!({"child_exit_code": code})))
             .map_err(|error| ("__test-block", error)),
@@ -425,18 +438,74 @@ fn init_logging() {
         .try_init();
 }
 
-fn authorized_reserved_command(
-    operation: &'static str,
+fn programming_command(
+    operation: ProgramOperation,
     args: &AuthorizedArgs,
+    cancellation: &CancellationToken,
 ) -> Result<(&'static str, serde_json::Value), (&'static str, SamdebugError)> {
-    validate_authorization(operation, args).map_err(|error| (operation, error))?;
-    Err((
-        operation,
-        SamdebugError::new(
-            ErrorCategory::Programming,
-            "NOT_IMPLEMENTED",
-            "authorization accepted, but programming is reserved for milestone M5",
-        ),
+    let name = match operation {
+        ProgramOperation::Erase => "erase",
+        ProgramOperation::Flash => "flash",
+        ProgramOperation::Reset | ProgramOperation::Halt => unreachable!("not CLI operations"),
+    };
+    let result = (|| {
+        let (root, config) = project_command_context()?;
+        let openocd = resolve_openocd(&config)?;
+        let elf = if operation == ProgramOperation::Flash {
+            let project_file = root.join(&config.project.path);
+            let imported = import_cproj(&project_file, config.project.configuration)?;
+            let build_directory = root
+                .join(".samdebug/build")
+                .join(&imported.plan.configuration);
+            Some(FirmwareArtifact {
+                path: build_directory.join(format!(
+                    "{}{}",
+                    imported.plan.output_name, imported.plan.output_extension
+                )),
+                build_directory,
+            })
+        } else {
+            None
+        };
+        OpenOcdProgrammer::new(&MacUsbProbeProvider, &SystemProcessRunner, openocd).execute(
+            operation,
+            &args.probe,
+            Some(&args.confirm),
+            elf.as_ref(),
+            cancellation,
+        )
+    })();
+    result
+        .map(|report| {
+            (
+                name,
+                serde_json::to_value(report).expect("programming report serializes"),
+            )
+        })
+        .map_err(|error| (name, error))
+}
+
+fn resolve_openocd(config: &SamdebugConfig) -> Result<OpenOcdConfig, SamdebugError> {
+    let executable = if let Some(system) = &config.tools.system {
+        PathBuf::from(&system.openocd)
+    } else {
+        managed_root()?.join("tools/openocd/0.12.0/bin/openocd")
+    };
+    let root = executable
+        .parent()
+        .and_then(std::path::Path::parent)
+        .ok_or_else(|| {
+            SamdebugError::new(
+                ErrorCategory::Tool,
+                "OPENOCD_CONFIGURATION_INVALID",
+                "OpenOCD path has no installation root",
+            )
+        })?
+        .to_path_buf();
+    Ok(OpenOcdConfig::new(
+        executable,
+        root.join("share/openocd/scripts"),
+        config.probe.speed_khz,
     ))
 }
 
@@ -578,19 +647,6 @@ fn run_internal_blocking_test(cancellation: &CancellationToken) -> Result<i32, S
         })?;
     }
     supervisor.wait_until_exit(cancellation, Duration::from_millis(10))
-}
-
-fn validate_authorization(operation: &str, args: &AuthorizedArgs) -> Result<(), SamdebugError> {
-    let expected = format!("{operation}:{}", args.probe);
-    if args.confirm == expected {
-        Ok(())
-    } else {
-        Err(SamdebugError::new(
-            ErrorCategory::Authorization,
-            "AUTHORIZATION_REJECTED",
-            format!("expected --confirm {expected}"),
-        ))
-    }
 }
 
 fn emit_success(format: OutputFormat, command: &str, data: serde_json::Value) {

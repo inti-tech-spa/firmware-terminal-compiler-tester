@@ -442,8 +442,20 @@ impl ProbeProvider for MacUsbProbeProvider {
                 "Atmel-ICE discovery is supported on macOS in version 1",
             ));
         }
+        let value = usb_inventory()?;
+        let mut found = Vec::new();
+        collect_atmel_ice(&value, &mut found);
+        found.sort_by(|left, right| left.serial.cmp(&right.serial));
+        found.dedup_by(|left, right| left.serial != "unknown" && left.serial == right.serial);
+        Ok(found)
+    }
+}
+
+fn usb_inventory() -> SamdebugResult<serde_json::Value> {
+    let mut last_error = String::new();
+    for data_type in ["SPUSBHostDataType", "SPUSBDataType"] {
         let output = Command::new("/usr/sbin/system_profiler")
-            .args(["SPUSBDataType", "-json"])
+            .args([data_type, "-json"])
             .output()
             .map_err(|error| {
                 SamdebugError::new(
@@ -453,25 +465,22 @@ impl ProbeProvider for MacUsbProbeProvider {
                 )
             })?;
         if !output.status.success() {
-            return Err(SamdebugError::new(
-                ErrorCategory::Connection,
-                "PROBE_DISCOVERY_FAILED",
-                String::from_utf8_lossy(&output.stderr),
-            ));
+            last_error = String::from_utf8_lossy(&output.stderr).into_owned();
+            continue;
         }
-        let value: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        return serde_json::from_slice(&output.stdout).map_err(|error| {
             SamdebugError::new(
                 ErrorCategory::Connection,
                 "PROBE_DISCOVERY_FAILED",
                 error.to_string(),
             )
-        })?;
-        let mut found = Vec::new();
-        collect_atmel_ice(&value, &mut found);
-        found.sort_by(|left, right| left.serial.cmp(&right.serial));
-        found.dedup_by(|left, right| left.serial == right.serial);
-        Ok(found)
+        });
     }
+    Err(SamdebugError::new(
+        ErrorCategory::Connection,
+        "PROBE_DISCOVERY_FAILED",
+        last_error,
+    ))
 }
 
 fn collect_atmel_ice(value: &serde_json::Value, found: &mut Vec<ProbeInfo>) {
@@ -486,22 +495,17 @@ fn collect_atmel_ice(value: &serde_json::Value, found: &mut Vec<ProbeInfo>) {
                 .get("_name")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            let product_id = object
-                .get("product_id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            let vendor_id = object
-                .get("vendor_id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
+            let product_id = string_field(object, &["product_id", "USBDeviceKeyProductID"]);
+            let vendor_id = string_field(object, &["vendor_id", "USBDeviceKeyVendorID"]);
             if name.to_ascii_lowercase().contains("atmel-ice")
                 || (vendor_id.contains("0x03eb") && product_id.contains("0x2141"))
             {
-                let serial = object
-                    .get("serial_num")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_owned();
+                let serial = string_field(object, &["serial_num", "USBDeviceKeySerialNumber"]);
+                let serial = if serial.is_empty() || serial == "Not Provided" {
+                    "unknown".into()
+                } else {
+                    serial.into()
+                };
                 found.push(ProbeInfo {
                     serial,
                     product: if name.is_empty() {
@@ -517,6 +521,16 @@ fn collect_atmel_ice(value: &serde_json::Value, found: &mut Vec<ProbeInfo>) {
         }
         _ => {}
     }
+}
+
+fn string_field<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    names: &[&str],
+) -> &'a str {
+    names
+        .iter()
+        .find_map(|name| object.get(*name).and_then(serde_json::Value::as_str))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -586,12 +600,12 @@ mod tests {
     #[test]
     fn system_profiler_tree_extracts_serial_and_deduplicates() {
         let fixture = serde_json::json!({
-            "SPUSBDataType": [{
+            "SPUSBHostDataType": [{
                 "_items": [{
                     "_name": "Atmel-ICE CMSIS-DAP",
-                    "vendor_id": "0x03eb",
-                    "product_id": "0x2141",
-                    "serial_num": "ICE123"
+                    "USBDeviceKeyVendorID": "0x03eb",
+                    "USBDeviceKeyProductID": "0x2141",
+                    "USBDeviceKeySerialNumber": "ICE123"
                 }]
             }]
         });
