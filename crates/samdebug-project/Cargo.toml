@@ -7,7 +7,14 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+roxmltree.workspace = true
 samdebug-core = { version = "=0.1.0", path = "../samdebug-core" }
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

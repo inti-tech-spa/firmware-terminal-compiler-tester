@@ -15,15 +15,16 @@ following hold:
   flags, libraries, library paths, linker flags/script, output name, and
   requested derivative artifacts are literal or use supported project macros.
 
-Supported macros are `$(MSBuildProjectName)`, `$(MSBuildProjectDirectory)`, and
-`$(Configuration)`. Windows separators are normalized after macro expansion.
+Supported macros are `$(MSBuildProjectName)`, `$(ProjectDir)`, and
+`$(Configuration)` (including Studio's `%24(ProjectDir)` encoding). Windows
+separators are normalized after macro expansion.
 The Microchip Studio Arm toolchain path is mapped to the managed Arm toolchain.
 Relative project and ASF paths remain relative to the `.cproj` directory.
 
 Absolute Microchip Studio CMSIS or SAM4S DFP include paths are not mapped to a
-bundled pack. They are omitted with a structured warning only when every header
-used by the imported compilation resolves through a later project-relative
-include path. Otherwise import fails with `MISSING_VENDOR_PACK` and instructs
+bundled pack. They are omitted with a structured warning only when the project
+contains and references the corresponding local CMSIS Core and SAM4S device
+include trees. Otherwise import fails with `MISSING_VENDOR_PACK` and instructs
 the user to add the required vendor files to the project. This matches the v1
 decision not to download or redistribute Microchip packs.
 
@@ -46,7 +47,9 @@ content found in XML.
 The `.cproj`, `.atsln`, source tree, ASF tree, linked external sources, and
 Studio `Debug`/`Release` directories are never written. Import metadata,
 normalized plans, objects, and artifacts are confined to the canonical
-project-local `.samdebug/`. Symlink or canonical-path escapes are rejected.
+project-local `.samdebug/`. Symlinks are rejected. A canonical-path escape is
+accepted only for a regular file with explicit MSBuild `Link` metadata; the
+linked source remains read-only.
 This permits reopening the unchanged project in Microchip Studio.
 
 Compatibility evidence compares normalized compile/link inputs and ELF

@@ -2,9 +2,11 @@ use std::{ffi::OsString, path::PathBuf, process::ExitCode, time::Duration};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use samdebug_core::{
-    CancellationToken, ErrorCategory, FiniteResult, SamdebugConfig, SamdebugError, SamdebugResult,
+    CancellationToken, Configuration, ErrorCategory, FiniteResult, SamdebugConfig, SamdebugError,
+    SamdebugResult,
     ports::{CommandSpec, DownloadReceipt, Downloader, FileSystem, ProcessRunner},
 };
+use samdebug_project::initialize_project;
 use samdebug_tools::{
     ChildSupervisor, CurlDownloader, Installer, MacUsbProbeProvider, Platform, SystemProcessRunner,
     ToolManifest, run_doctor, run_system_doctor,
@@ -221,6 +223,21 @@ fn dispatch(
                 )
             })
             .map_err(|error| ("doctor", error)),
+        Command::Init(args) => {
+            let configuration = match args.configuration.as_str() {
+                "Debug" => Configuration::Debug,
+                "Release" => Configuration::Release,
+                _ => unreachable!("clap validates configurations"),
+            };
+            initialize_project(&args.from_cproj, configuration)
+                .map(|report| {
+                    (
+                        "init",
+                        serde_json::to_value(report).expect("init report serializes"),
+                    )
+                })
+                .map_err(|error| ("init", error))
+        }
         Command::Debug(args) if !args.agent => samdebug_tui::run()
             .map(|()| ("debug", json!({})))
             .map_err(|error| ("debug", error)),
