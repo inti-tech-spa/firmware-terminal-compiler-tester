@@ -203,6 +203,66 @@ fn rejects_cpp_generated_missing_duplicate_and_unknown_macro_inputs() {
 }
 
 #[test]
+fn rejects_conditions_external_builds_and_conflicting_scalars() {
+    for (needle, replacement, expected) in [
+        (
+            "<Compile Include=\"src\\main.c\"",
+            "<Compile Condition=\"'$(Configuration)' == 'Release'\" Include=\"src\\main.c\"",
+            "CONDITION_SCOPE_UNSUPPORTED",
+        ),
+        (
+            "<ItemGroup>",
+            "<Makefile>external.mk</Makefile><ItemGroup>",
+            "IMPORTED_BUILD_HOOK_REJECTED",
+        ),
+        (
+            "<armgcc.compiler.optimization.level>Optimize (-O1)</armgcc.compiler.optimization.level>",
+            "<armgcc.compiler.optimization.level>Optimize (-O1)</armgcc.compiler.optimization.level><armgcc.compiler.optimization.level>Optimize (-O3)</armgcc.compiler.optimization.level>",
+            "CONFLICTING_SCALAR_SETTING",
+        ),
+        (
+            "-pipe -std=gnu99",
+            "-pipe $(UnknownFlag) -std=gnu99",
+            "UNKNOWN_MSBUILD_EXPRESSION",
+        ),
+        (
+            "src\\main.c",
+            "$(UnknownSource)\\main.c",
+            "UNKNOWN_MSBUILD_EXPRESSION",
+        ),
+    ] {
+        let temp = copy_fixture();
+        let path = temp.path().join("valid/project.cproj");
+        let text =
+            fs::read_to_string(&path)
+                .expect("read fixture")
+                .replacen(needle, replacement, 1);
+        fs::write(&path, text).expect("write rejected fixture");
+        let error = import_cproj(&path, Configuration::Debug).expect_err(expected);
+        assert_eq!(error.code(), expected);
+        let value = serde_json::to_value(error).expect("serialize location");
+        assert!(value["details"]["line"].as_u64().is_some());
+        assert!(value["details"]["element"].as_str().is_some());
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn init_rejects_symlinked_state_directory_without_external_writes() {
+    use std::os::unix::fs::symlink;
+
+    let temp = copy_fixture();
+    let external = tempfile::tempdir().expect("external temp");
+    let project = temp.path().join("valid");
+    symlink(external.path(), project.join(".samdebug")).expect("state symlink");
+    let error = initialize_project(&project.join("project.cproj"), Configuration::Debug)
+        .expect_err("reject state symlink");
+    assert_eq!(error.code(), "UNSAFE_STATE_DIRECTORY");
+    assert!(!external.path().join("import-plan.json").exists());
+    assert!(!project.join("samdebug.toml").exists());
+}
+
+#[test]
 fn imports_real_project_when_explicitly_supplied() {
     let Some(path) = std::env::var_os("SAMDEBUG_REAL_CPROJ").map(PathBuf::from) else {
         return;

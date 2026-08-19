@@ -90,6 +90,40 @@ pub fn import_cproj(path: &Path, configuration: Configuration) -> SamdebugResult
         ));
     }
     let settings = groups[0];
+    validate_conflicting_scalars(
+        path,
+        &document,
+        base,
+        &[
+            "Name",
+            "OutputFileName",
+            "OutputFileExtension",
+            "ToolchainName",
+            "Language",
+            "OutputType",
+            "avrdevice",
+        ],
+    )?;
+    validate_conflicting_scalars(
+        path,
+        &document,
+        settings,
+        &[
+            "armgcc.compiler.optimization.level",
+            "armgcc.compiler.optimization.DebugLevel",
+            "armgcc.compiler.miscellaneous.OtherFlags",
+            "armgcc.compiler.optimization.OtherFlags",
+            "armgcc.preprocessingassembler.general.AssemblerFlags",
+            "armgcc.preprocessingassembler.debugging.DebugLevel",
+            "armgcc.linker.miscellaneous.LinkerFlags",
+            "armgcc.linker.optimization.GarbageCollectUnusedSections",
+            "armgcc.common.outputfiles.bin",
+            "armgcc.common.outputfiles.hex",
+            "armgcc.common.outputfiles.lss",
+            "armgcc.common.outputfiles.eep",
+            "armgcc.common.outputfiles.srec",
+        ],
+    )?;
     let project_root = path.parent().unwrap_or_else(|| Path::new("."));
     let canonical_root = project_root
         .canonicalize()
@@ -136,6 +170,8 @@ pub fn import_cproj(path: &Path, configuration: Configuration) -> SamdebugResult
         path,
         &document,
         descendant(settings, "armgcc.compiler.miscellaneous.OtherFlags"),
+        &project_name,
+        configuration_name,
     )?;
     append_label_flag(
         settings,
@@ -155,6 +191,8 @@ pub fn import_cproj(path: &Path, configuration: Configuration) -> SamdebugResult
             path,
             &document,
             descendant(settings, "armgcc.compiler.optimization.OtherFlags"),
+            &project_name,
+            configuration_name,
         )?,
     );
     let mut assembler_flags = tokenize_node(
@@ -164,6 +202,8 @@ pub fn import_cproj(path: &Path, configuration: Configuration) -> SamdebugResult
             settings,
             "armgcc.preprocessingassembler.general.AssemblerFlags",
         ),
+        &project_name,
+        configuration_name,
     )?;
     append_label_flag(
         settings,
@@ -175,6 +215,8 @@ pub fn import_cproj(path: &Path, configuration: Configuration) -> SamdebugResult
         path,
         &document,
         descendant(settings, "armgcc.linker.miscellaneous.LinkerFlags"),
+        &project_name,
+        configuration_name,
     )?;
     if bool_setting(
         settings,
@@ -182,15 +224,26 @@ pub fn import_cproj(path: &Path, configuration: Configuration) -> SamdebugResult
     ) {
         push_unique(&mut linker_flags, "-Wl,--gc-sections".into());
     }
-    let linker_script = normalize_linker_script(path, &document, &mut linker_flags)?;
+    let linker_node = descendant(settings, "armgcc.linker.miscellaneous.LinkerFlags");
+    let linker_script = normalize_linker_script(path, &document, linker_node, &mut linker_flags)?;
+    let output_node = descendant(base, "OutputFileName");
     let output_name = expand_value(
-        child_text(base, "OutputFileName").unwrap_or("$(MSBuildProjectName)"),
+        output_node
+            .and_then(|node| node.text())
+            .unwrap_or("$(MSBuildProjectName)"),
         &project_name,
         configuration_name,
-    )?;
-    let output_extension = child_text(base, "OutputFileExtension")
-        .unwrap_or(".elf")
-        .to_owned();
+    )
+    .map_err(|error| expression_error(path, &document, output_node.unwrap_or(base), &error))?;
+    let extension_node = descendant(base, "OutputFileExtension");
+    let output_extension = expand_value(
+        extension_node
+            .and_then(|node| node.text())
+            .unwrap_or(".elf"),
+        &project_name,
+        configuration_name,
+    )
+    .map_err(|error| expression_error(path, &document, extension_node.unwrap_or(base), &error))?;
     Ok(ImportResult {
         plan: BuildPlan {
             schema_version: 1,
@@ -207,12 +260,26 @@ pub fn import_cproj(path: &Path, configuration: Configuration) -> SamdebugResult
             build_directory: format!(".samdebug/build/{configuration_name}"),
             sources,
             headers,
-            symbols: values(settings, "armgcc.compiler.symbols.DefSymbols"),
+            symbols: checked_values(
+                path,
+                &document,
+                settings,
+                "armgcc.compiler.symbols.DefSymbols",
+                &project_name,
+                configuration_name,
+            )?,
             include_directories,
             compiler_flags,
             assembler_include_directories,
             assembler_flags,
-            libraries: values(settings, "armgcc.linker.libraries.Libraries"),
+            libraries: checked_values(
+                path,
+                &document,
+                settings,
+                "armgcc.linker.libraries.Libraries",
+                &project_name,
+                configuration_name,
+            )?,
             library_search_paths: normalize_paths(
                 path,
                 &document,
@@ -248,7 +315,29 @@ pub fn initialize_project(path: &Path, configuration: Configuration) -> Samdebug
         ));
     }
     let state = root.join(".samdebug");
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| project_io("PROJECT_ROOT_INVALID", &error))?;
+    if let Ok(metadata) = fs::symlink_metadata(&state)
+        && (metadata.file_type().is_symlink() || !metadata.is_dir())
+    {
+        return Err(SamdebugError::new(
+            ErrorCategory::Project,
+            "UNSAFE_STATE_DIRECTORY",
+            ".samdebug must be a real project-local directory",
+        ));
+    }
     fs::create_dir_all(&state).map_err(|error| project_io("STATE_DIRECTORY_FAILED", &error))?;
+    let canonical_state = state
+        .canonicalize()
+        .map_err(|error| project_io("STATE_DIRECTORY_INVALID", &error))?;
+    if !canonical_state.starts_with(&canonical_root) {
+        return Err(SamdebugError::new(
+            ErrorCategory::Project,
+            "STATE_DIRECTORY_ESCAPE",
+            ".samdebug resolves outside the project",
+        ));
+    }
     let plan_path = state.join("import-plan.json");
     let config = SamdebugConfig {
         schema_version: 1,
@@ -331,6 +420,7 @@ fn validate_identity(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_unsupported_constructs(
     path: &Path,
     document: &Document<'_>,
@@ -341,6 +431,8 @@ fn validate_unsupported_constructs(
         let lower = name.to_ascii_lowercase();
         if name == "Target"
             || name == "Exec"
+            || lower == "makefile"
+            || lower == "externalmakefile"
             || lower.contains("prebuild")
             || lower.contains("postbuild")
             || lower.contains("custombuild")
@@ -364,16 +456,27 @@ fn validate_unsupported_constructs(
                 "replace wildcard inputs with explicit project items",
             ));
         }
-        if let Some(condition) = node.attribute("Condition")
-            && parse_configuration_condition(condition).is_none()
-        {
-            return Err(node_error(
-                path,
-                document,
-                node,
-                "UNRESOLVED_CONDITION",
-                format!("unsupported MSBuild condition: {condition}"),
-            ));
+        if let Some(condition) = node.attribute("Condition") {
+            if parse_configuration_condition(condition).is_none() {
+                return Err(node_error(
+                    path,
+                    document,
+                    node,
+                    "UNRESOLVED_CONDITION",
+                    format!("unsupported MSBuild condition: {condition}"),
+                ));
+            }
+            let supported_scope =
+                name == "PropertyGroup" && node.parent().is_some_and(|parent| parent == root);
+            if !supported_scope {
+                return Err(node_error(
+                    path,
+                    document,
+                    node,
+                    "CONDITION_SCOPE_UNSUPPORTED",
+                    "conditions are supported only on top-level configuration PropertyGroup elements",
+                ));
+            }
         }
         if name == "Import" {
             let imported = normalize_separators(node.attribute("Project").unwrap_or_default());
@@ -399,6 +502,35 @@ fn validate_unsupported_constructs(
                     node,
                     "MSBUILD_PROPERTY_FUNCTION_REJECTED",
                     "MSBuild property functions are not evaluated",
+                ));
+            }
+            if value.contains("@(") || value.contains("%(") {
+                return Err(node_error(
+                    path,
+                    document,
+                    node,
+                    "MSBUILD_ITEM_EXPRESSION_REJECTED",
+                    "MSBuild item lists and transforms are not evaluated",
+                ));
+            }
+            let remainder = [
+                "$(AVRSTUDIO_EXE_PATH)",
+                "$(Configuration)",
+                "$(MSBuildProjectDirectory)",
+                "$(MSBuildProjectName)",
+                "$(ProjectDir)",
+                "%24(PackRepoDir)",
+                "%24(ProjectDir)",
+            ]
+            .into_iter()
+            .fold(value.to_owned(), |text, allowed| text.replace(allowed, ""));
+            if remainder.contains("$(") || remainder.contains("%24(") {
+                return Err(node_error(
+                    path,
+                    document,
+                    node,
+                    "UNKNOWN_MSBUILD_EXPRESSION",
+                    format!("unsupported MSBuild expression in {value}"),
                 ));
             }
         }
@@ -432,13 +564,18 @@ fn parse_items(
                 "Compile item has no Include",
             )
         })?;
-        let expanded = expand_value(raw, project_name, configuration)?;
+        let expanded = expand_value(raw, project_name, configuration)
+            .map_err(|error| expression_error(path, document, node, &error))?;
         let normalized = normalize_separators(&expanded);
-        let link_name = node
-            .children()
-            .find(|child| child.has_tag_name("Link"))
+        let link_node = node.children().find(|child| child.has_tag_name("Link"));
+        let link_name = link_node
             .and_then(|child| child.text())
-            .map(normalize_separators);
+            .map(|value| {
+                expand_value(value, project_name, configuration)
+                    .map(|expanded| normalize_separators(&expanded))
+                    .map_err(|error| expression_error(path, document, link_node.unwrap(), &error))
+            })
+            .transpose()?;
         let relative = clean_relative(&normalized, link_name.is_some())
             .map_err(|message| node_error(path, document, node, "UNSAFE_PROJECT_PATH", message))?;
         let candidate = project_root.join(&relative);
@@ -554,7 +691,8 @@ fn parse_include_paths(
         if value.contains("%24(PackRepoDir)") || value.contains("$(PackRepoDir)") {
             vendor.push(node);
         } else {
-            let normalized = normalize_setting_path(value, "", "")?;
+            let normalized = normalize_setting_path(value, "", "")
+                .map_err(|error| expression_error(path, document, node, &error))?;
             if !project_root.join(&normalized).is_dir() {
                 return Err(node_error(
                     path,
@@ -621,6 +759,7 @@ fn normalize_paths(
 fn normalize_linker_script(
     path: &Path,
     document: &Document<'_>,
+    source_node: Option<Node<'_, '_>>,
     flags: &mut Vec<String>,
 ) -> SamdebugResult<Option<String>> {
     let mut script = None;
@@ -633,13 +772,22 @@ fn normalize_linker_script(
         };
         if let Some(value) = candidate {
             if script.is_some() {
-                return Err(SamdebugError::new(
-                    ErrorCategory::Project,
+                return Err(node_error(
+                    path,
+                    document,
+                    source_node.unwrap_or(document.root_element()),
                     "CONFLICTING_LINKER_SCRIPT",
                     "multiple linker scripts are unsupported",
                 ));
             }
-            script = Some(normalize_setting_path(&value, "", "")?);
+            script = Some(normalize_setting_path(&value, "", "").map_err(|error| {
+                expression_error(
+                    path,
+                    document,
+                    source_node.unwrap_or(document.root_element()),
+                    &error,
+                )
+            })?);
             if flags[index] == "-T" {
                 flags.drain(index..=index + 1);
             } else {
@@ -655,7 +803,7 @@ fn normalize_linker_script(
             return Err(node_error(
                 path,
                 document,
-                document.root_element(),
+                source_node.unwrap_or(document.root_element()),
                 "LINKER_SCRIPT_MISSING",
                 format!("linker script does not exist: {script}"),
             ));
@@ -668,11 +816,15 @@ fn tokenize_node(
     path: &Path,
     document: &Document<'_>,
     node: Option<Node<'_, '_>>,
+    project_name: &str,
+    configuration: &str,
 ) -> SamdebugResult<Vec<String>> {
     let Some(node) = node else {
         return Ok(Vec::new());
     };
-    tokenize(node.text().unwrap_or_default())
+    let expanded = expand_value(node.text().unwrap_or_default(), project_name, configuration)
+        .map_err(|error| expression_error(path, document, node, &error))?;
+    tokenize(&expanded)
         .map_err(|message| node_error(path, document, node, "INVALID_ARGUMENT_LIST", message))
 }
 
@@ -730,14 +882,53 @@ fn append_label_flag(
     }
 }
 
-fn values<'a>(settings: Node<'a, 'a>, tag: &str) -> Vec<String> {
+fn checked_values(
+    path: &Path,
+    document: &Document<'_>,
+    settings: Node<'_, '_>,
+    tag: &str,
+    project_name: &str,
+    configuration: &str,
+) -> SamdebugResult<Vec<String>> {
     values_nodes(settings, tag)
         .into_iter()
-        .filter_map(|node| node.text())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
+        .filter_map(|node| {
+            let value = node.text()?.trim();
+            (!value.is_empty()).then_some((node, value))
+        })
+        .map(|(node, value)| {
+            expand_value(value, project_name, configuration)
+                .map_err(|error| expression_error(path, document, node, &error))
+        })
         .collect()
+}
+
+fn validate_conflicting_scalars(
+    path: &Path,
+    document: &Document<'_>,
+    scope: Node<'_, '_>,
+    tags: &[&str],
+) -> SamdebugResult<()> {
+    for tag in tags {
+        let nodes: Vec<_> = scope
+            .descendants()
+            .filter(|node| node.has_tag_name(*tag))
+            .collect();
+        let distinct: BTreeSet<_> = nodes
+            .iter()
+            .map(|node| node.text().unwrap_or_default().trim())
+            .collect();
+        if distinct.len() > 1 {
+            return Err(node_error(
+                path,
+                document,
+                nodes[1],
+                "CONFLICTING_SCALAR_SETTING",
+                format!("conflicting values for {tag}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn values_nodes<'a>(settings: Node<'a, 'a>, tag: &str) -> Vec<Node<'a, 'a>> {
@@ -908,6 +1099,15 @@ fn node_error(
     let location = location(path, document, node);
     SamdebugError::new(ErrorCategory::Project, code, message)
         .with_details(serde_json::to_value(location).expect("XML location serializes"))
+}
+
+fn expression_error(
+    path: &Path,
+    document: &Document<'_>,
+    node: Node<'_, '_>,
+    error: &SamdebugError,
+) -> SamdebugError {
+    node_error(path, document, node, error.code(), error.to_string())
 }
 
 fn location(path: &Path, document: &Document<'_>, node: Node<'_, '_>) -> XmlLocation {
