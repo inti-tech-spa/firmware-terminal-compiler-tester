@@ -1,7 +1,7 @@
 use std::{path::Path, process::Command};
 
 use samdebug_core::{
-    ErrorCategory, SamdebugError, SamdebugResult,
+    ErrorCategory, SamdebugError, SamdebugResult, SystemToolConfig,
     ports::{CommandSpec, ProbeInfo, ProbeProvider, ProcessRunner},
 };
 use serde::Serialize;
@@ -13,6 +13,7 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DoctorReport {
+    pub tool_channel: String,
     pub platform: PlatformReport,
     pub manifest_installable: bool,
     pub root: String,
@@ -95,6 +96,7 @@ pub fn run_doctor(
     let probe = inspect_probe(&selected, root, probes, runner, &mut guidance);
 
     Ok(DoctorReport {
+        tool_channel: "pinned".into(),
         platform: PlatformReport {
             os: platform.os.clone(),
             architecture: platform.architecture.clone(),
@@ -106,6 +108,109 @@ pub fn run_doctor(
         probe,
         guidance,
     })
+}
+
+pub fn run_system_doctor(
+    tools: &SystemToolConfig,
+    platform: &Platform,
+    probes: &dyn ProbeProvider,
+    runner: &dyn ProcessRunner,
+) -> SamdebugResult<DoctorReport> {
+    let definitions = [
+        ("arm-none-eabi-gcc", &tools.gcc, "arm-none-eabi-gcc"),
+        ("arm-none-eabi-gdb", &tools.gdb, "GNU gdb"),
+        ("openocd", &tools.openocd, "Open On-Chip Debugger"),
+        ("arm-none-eabi-objcopy", &tools.objcopy, "GNU objcopy"),
+        ("arm-none-eabi-objdump", &tools.objdump, "GNU objdump"),
+        ("arm-none-eabi-size", &tools.size, "GNU size"),
+    ];
+    let executables: Vec<_> = definitions
+        .iter()
+        .map(|(name, path, expected)| inspect_system_executable(name, path, expected, runner))
+        .collect();
+    let openocd_verified = executables
+        .iter()
+        .find(|executable| executable.name == "openocd")
+        .is_some_and(|executable| executable.status == "verified");
+    let mut guidance = vec![
+        "system tool override is active; builds are not reproducible from the pinned manifest"
+            .into(),
+    ];
+    let probe = inspect_probe_with_openocd(
+        probes,
+        runner,
+        openocd_verified.then_some(Path::new(&tools.openocd)),
+        None,
+        &mut guidance,
+    );
+    Ok(DoctorReport {
+        tool_channel: "system".into(),
+        platform: PlatformReport {
+            os: platform.os.clone(),
+            architecture: platform.architecture.clone(),
+            supported: platform.os == "macos" && platform.architecture == "aarch64",
+        },
+        manifest_installable: false,
+        root: "system".into(),
+        tools: vec![ToolHealth {
+            name: "system-tools".into(),
+            version: "unmanaged".into(),
+            install: if executables
+                .iter()
+                .all(|executable| executable.status == "verified")
+            {
+                "verified".into()
+            } else {
+                "invalid".into()
+            },
+            cache: "not_applicable".into(),
+            executables,
+        }],
+        probe,
+        guidance,
+    })
+}
+
+fn inspect_system_executable(
+    name: &str,
+    path: &str,
+    expected: &str,
+    runner: &dyn ProcessRunner,
+) -> ExecutableHealth {
+    if !Path::new(path).is_file() {
+        return ExecutableHealth {
+            name: name.into(),
+            status: "missing".into(),
+            reported_version: None,
+        };
+    }
+    match runner.run(&CommandSpec {
+        program: path.into(),
+        args: vec!["--version".into()],
+        current_dir: None,
+    }) {
+        Ok(output) => {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            ExecutableHealth {
+                name: name.into(),
+                status: if output.exit_code == Some(0) && text.contains(expected) {
+                    "verified".into()
+                } else {
+                    "version_mismatch".into()
+                },
+                reported_version: Some(text.lines().next().unwrap_or_default().into()),
+            }
+        }
+        Err(error) => ExecutableHealth {
+            name: name.into(),
+            status: "failed".into(),
+            reported_version: Some(error.to_string()),
+        },
+    }
 }
 
 fn inspect_tools(
@@ -122,6 +227,7 @@ fn inspect_tools(
                 .join(&artifact.version);
             let install = match install_is_valid(&destination, artifact) {
                 Ok(true) => "verified",
+                Ok(false) if destination.exists() => "corrupt",
                 Ok(false) => "missing",
                 Err(_) => "corrupt",
             };
@@ -203,6 +309,42 @@ fn inspect_probe(
     runner: &dyn ProcessRunner,
     guidance: &mut Vec<String>,
 ) -> ProbeHealth {
+    let managed = artifacts
+        .iter()
+        .find(|artifact| artifact.name == "openocd")
+        .and_then(|artifact| {
+            let installation = root
+                .join("tools")
+                .join(&artifact.name)
+                .join(&artifact.version);
+            if install_is_valid(&installation, artifact).ok() != Some(true) {
+                return None;
+            }
+            let executable = artifact
+                .executables
+                .iter()
+                .find(|executable| executable.name == "openocd")?;
+            Some((
+                installation.join(&executable.path),
+                installation.join("share/openocd/scripts"),
+            ))
+        });
+    inspect_probe_with_openocd(
+        probes,
+        runner,
+        managed.as_ref().map(|(executable, _)| executable.as_path()),
+        managed.as_ref().map(|(_, scripts)| scripts.as_path()),
+        guidance,
+    )
+}
+
+fn inspect_probe_with_openocd(
+    probes: &dyn ProbeProvider,
+    runner: &dyn ProcessRunner,
+    openocd: Option<&Path>,
+    scripts: Option<&Path>,
+    guidance: &mut Vec<String>,
+) -> ProbeHealth {
     let (status, probe_list): (String, Vec<ProbeInfo>) = match probes.list() {
         Ok(found) if found.is_empty() => ("absent".into(), Vec::new()),
         Ok(found) if found.len() == 1 => ("visible".into(), found),
@@ -215,7 +357,7 @@ fn inspect_probe(
     if status == "absent" {
         guidance.push("connect Atmel-ICE over USB; no separate macOS driver is required".into());
     }
-    let (target_connectivity, target_voltage) = diagnose_target(artifacts, root, runner, &status);
+    let (target_connectivity, target_voltage) = diagnose_target(openocd, scripts, runner, &status);
     ProbeHealth {
         status,
         probes: probe_list
@@ -231,52 +373,38 @@ fn inspect_probe(
 }
 
 fn diagnose_target(
-    artifacts: &[&crate::ToolArtifact],
-    root: &Path,
+    openocd: Option<&Path>,
+    scripts: Option<&Path>,
     runner: &dyn ProcessRunner,
     probe_status: &str,
 ) -> (String, Option<String>) {
     if probe_status != "visible" {
         return ("not_checked".into(), None);
     }
-    let Some(openocd) = artifacts.iter().find(|artifact| artifact.name == "openocd") else {
+    let Some(openocd) = openocd else {
         return ("openocd_unavailable".into(), None);
     };
-    let Some(executable) = openocd
-        .executables
-        .iter()
-        .find(|executable| executable.name == "openocd")
-    else {
-        return ("openocd_unavailable".into(), None);
-    };
-    let installation = root
-        .join("tools")
-        .join(&openocd.name)
-        .join(&openocd.version);
+    let mut args = Vec::new();
+    if let Some(scripts) = scripts {
+        args.extend(["-s".into(), scripts.to_string_lossy().into_owned()]);
+    }
+    args.extend([
+        "-f".into(),
+        "interface/cmsis-dap.cfg".into(),
+        "-c".into(),
+        "transport select swd".into(),
+        "-f".into(),
+        "target/at91sam4sXX.cfg".into(),
+        "-c".into(),
+        "adapter speed 1000".into(),
+        "-c".into(),
+        "init".into(),
+        "-c".into(),
+        "shutdown".into(),
+    ]);
     let output = runner.run(&CommandSpec {
-        program: installation
-            .join(&executable.path)
-            .to_string_lossy()
-            .into_owned(),
-        args: vec![
-            "-s".into(),
-            installation
-                .join("share/openocd/scripts")
-                .to_string_lossy()
-                .into_owned(),
-            "-f".into(),
-            "interface/cmsis-dap.cfg".into(),
-            "-c".into(),
-            "transport select swd".into(),
-            "-f".into(),
-            "target/at91sam4sXX.cfg".into(),
-            "-c".into(),
-            "adapter speed 1000".into(),
-            "-c".into(),
-            "init".into(),
-            "-c".into(),
-            "shutdown".into(),
-        ],
+        program: openocd.to_string_lossy().into_owned(),
+        args,
         current_dir: None,
     });
     match output {
@@ -497,5 +625,28 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("windows-x86_64"))
         );
+    }
+
+    #[test]
+    fn visible_probe_with_missing_managed_openocd_is_not_a_target_failure() {
+        let temp = TempDir::new().expect("tempdir");
+        let manifest: ToolManifest =
+            serde_json::from_str(include_str!("../../../tools/manifest-v1.json"))
+                .expect("embedded manifest parses");
+        let report = run_doctor(
+            &manifest,
+            temp.path(),
+            &Platform {
+                os: "macos".into(),
+                architecture: "aarch64".into(),
+            },
+            &FakeProbes(vec![ProbeInfo {
+                serial: "ICE123".into(),
+                product: "Atmel-ICE".into(),
+            }]),
+            &FakeRunner,
+        )
+        .expect("doctor report");
+        assert_eq!(report.probe.target_connectivity, "openocd_unavailable");
     }
 }

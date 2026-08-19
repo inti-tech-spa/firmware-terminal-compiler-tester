@@ -3,7 +3,9 @@
 mod doctor;
 mod installer;
 
-pub use doctor::{DoctorReport, MacUsbProbeProvider, ProbeHealth, ToolHealth, run_doctor};
+pub use doctor::{
+    DoctorReport, MacUsbProbeProvider, ProbeHealth, ToolHealth, run_doctor, run_system_doctor,
+};
 pub use installer::{
     ArchiveSpec, CurlDownloader, ExecutableSpec, InstallReport, Installer, LicenseSpec, Platform,
     ToolArtifact, ToolManifest,

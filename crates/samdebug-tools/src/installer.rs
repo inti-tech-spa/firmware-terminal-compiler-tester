@@ -3,12 +3,13 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{BufReader, BufWriter, Read, Write},
     path::{Component, Path, PathBuf},
-    process::Command,
-    time::{SystemTime, UNIX_EPOCH},
+    process::{Command, Output, Stdio},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use samdebug_core::{
-    ErrorCategory, SamdebugError, SamdebugResult,
+    CancellationToken, ErrorCategory, SamdebugError, SamdebugResult,
     ports::{DownloadReceipt, Downloader},
 };
 use serde::{Deserialize, Serialize};
@@ -96,19 +97,27 @@ pub struct Installer<'a> {
     root: PathBuf,
     platform: Platform,
     downloader: &'a dyn Downloader,
+    cancellation: &'a CancellationToken,
 }
 
 impl<'a> Installer<'a> {
     #[must_use]
-    pub fn new(root: PathBuf, platform: Platform, downloader: &'a dyn Downloader) -> Self {
+    pub fn new(
+        root: PathBuf,
+        platform: Platform,
+        downloader: &'a dyn Downloader,
+        cancellation: &'a CancellationToken,
+    ) -> Self {
         Self {
             root,
             platform,
             downloader,
+            cancellation,
         }
     }
 
     pub fn install(&self, manifest: &ToolManifest, offline: bool) -> SamdebugResult<InstallReport> {
+        check_cancelled(self.cancellation)?;
         validate_manifest(manifest)?;
         if !manifest.installable {
             return Err(SamdebugError::new(
@@ -156,6 +165,7 @@ impl<'a> Installer<'a> {
         let mut installed = Vec::new();
         let mut reused = Vec::new();
         for artifact in selected {
+            check_cancelled(self.cancellation)?;
             let key = format!("{}@{}", artifact.name, artifact.version);
             if self.install_one(artifact, offline)? {
                 installed.push(key);
@@ -172,13 +182,14 @@ impl<'a> Installer<'a> {
     }
 
     fn install_one(&self, artifact: &ToolArtifact, offline: bool) -> SamdebugResult<bool> {
+        check_cancelled(self.cancellation)?;
         let destination = self
             .root
             .join("tools")
             .join(&artifact.name)
             .join(&artifact.version);
-        if install_is_valid(&destination, artifact)? {
-            validate_executable_versions(&destination, artifact)?;
+        if install_is_valid_with_cancellation(&destination, artifact, self.cancellation)? {
+            validate_executable_versions(&destination, artifact, self.cancellation)?;
             return Ok(false);
         }
         if destination.exists() {
@@ -190,7 +201,8 @@ impl<'a> Installer<'a> {
             .root
             .join("downloads")
             .join(format!("{}-{}.tar.xz", artifact.name, artifact.sha256));
-        let cache_valid = archive_path.exists() && sha256_file(&archive_path)? == artifact.sha256;
+        let cache_valid = archive_path.exists()
+            && sha256_file_with_cancellation(&archive_path, self.cancellation)? == artifact.sha256;
         if !cache_valid {
             if archive_path.exists() {
                 fs::remove_file(&archive_path)
@@ -214,14 +226,21 @@ impl<'a> Installer<'a> {
         fs::create_dir(&staging).map_err(|error| io_error("STAGING_CREATE_FAILED", &error))?;
 
         let result = (|| {
-            extract_tar_xz(&archive_path, &staging, &artifact.archive)?;
-            validate_staged(&staging, artifact)?;
-            validate_executable_versions(&staging, artifact)?;
+            extract_tar_xz(
+                &archive_path,
+                &staging,
+                &artifact.archive,
+                self.cancellation,
+            )?;
+            validate_staged(&staging, artifact, self.cancellation)?;
+            validate_executable_versions(&staging, artifact, self.cancellation)?;
+            let files = inventory_tree(&staging, self.cancellation)?;
             let marker = InstallMarker {
-                schema_version: 1,
+                schema_version: 2,
                 name: artifact.name.clone(),
                 version: artifact.version.clone(),
                 archive_sha256: artifact.sha256.clone(),
+                files,
             };
             let marker_bytes = serde_json::to_vec_pretty(&marker).expect("marker serializes");
             write_new(&staging.join("install.json"), &marker_bytes, 0o644)?;
@@ -238,11 +257,14 @@ impl<'a> Installer<'a> {
     fn download_verified(&self, artifact: &ToolArtifact, destination: &Path) -> SamdebugResult<()> {
         let partial = destination.with_extension(format!("partial-{}", nonce()?));
         let result = (|| {
-            let receipt =
-                self.downloader
-                    .download(&artifact.url, &artifact.allowed_hosts, &partial)?;
+            let receipt = self.downloader.download(
+                &artifact.url,
+                &artifact.allowed_hosts,
+                &partial,
+                self.cancellation,
+            )?;
             validate_download_url(&receipt.final_url, &artifact.allowed_hosts)?;
-            let actual = sha256_file(&partial)?;
+            let actual = sha256_file_with_cancellation(&partial, self.cancellation)?;
             if actual != artifact.sha256 {
                 return Err(SamdebugError::new(
                     ErrorCategory::Tool,
@@ -305,6 +327,15 @@ struct InstallMarker {
     name: String,
     version: String,
     archive_sha256: String,
+    #[serde(default)]
+    files: Vec<InstalledFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct InstalledFile {
+    path: String,
+    size: u64,
+    sha256: String,
 }
 
 pub(crate) fn validate_manifest(manifest: &ToolManifest) -> SamdebugResult<()> {
@@ -396,27 +427,26 @@ fn validate_relative(value: &str) -> SamdebugResult<()> {
     Ok(())
 }
 
-fn extract_tar_xz(archive: &Path, staging: &Path, spec: &ArchiveSpec) -> SamdebugResult<()> {
+fn extract_tar_xz(
+    archive: &Path,
+    staging: &Path,
+    spec: &ArchiveSpec,
+    cancellation: &CancellationToken,
+) -> SamdebugResult<()> {
+    extract_tar_xz_with_limit(archive, staging, spec, cancellation, MAX_EXPANDED_BYTES)
+}
+
+fn extract_tar_xz_with_limit(
+    archive: &Path,
+    staging: &Path,
+    spec: &ArchiveSpec,
+    cancellation: &CancellationToken,
+    extracted_limit: u64,
+) -> SamdebugResult<()> {
+    check_cancelled(cancellation)?;
     let tar_path = staging.with_extension(format!("expanded-{}.tar", nonce()?));
     let result = (|| {
-        let mut compressed = BufReader::new(
-            File::open(archive).map_err(|error| io_error("ARCHIVE_OPEN_FAILED", &error))?,
-        );
-        let expanded_file = BufWriter::new(
-            File::create(&tar_path).map_err(|error| io_error("ARCHIVE_TEMP_FAILED", &error))?,
-        );
-        let mut expanded = LimitedWriter::new(expanded_file, MAX_EXPANDED_BYTES);
-        lzma_rs::xz_decompress(&mut compressed, &mut expanded).map_err(|error| {
-            SamdebugError::new(
-                ErrorCategory::Tool,
-                "ARCHIVE_DECOMPRESSION_FAILED",
-                error.to_string(),
-            )
-        })?;
-        expanded
-            .flush()
-            .map_err(|error| io_error("ARCHIVE_TEMP_FAILED", &error))?;
-        drop(expanded);
+        decompress_xz(archive, &tar_path, cancellation)?;
 
         let mut tar = tar::Archive::new(
             File::open(&tar_path).map_err(|error| io_error("ARCHIVE_TEMP_FAILED", &error))?,
@@ -426,6 +456,7 @@ fn extract_tar_xz(archive: &Path, staging: &Path, spec: &ArchiveSpec) -> Samdebu
         let mut expanded_bytes = 0u64;
         let mut pending_hard_links = Vec::new();
         for entry in entries {
+            check_cancelled(cancellation)?;
             entry_count += 1;
             if entry_count > MAX_ARCHIVE_ENTRIES {
                 return Err(archive_security_error("archive has too many entries"));
@@ -466,7 +497,7 @@ fn extract_tar_xz(archive: &Path, staging: &Path, spec: &ArchiveSpec) -> Samdebu
             expanded_bytes = expanded_bytes
                 .checked_add(size)
                 .ok_or_else(|| archive_security_error("archive size overflow"))?;
-            if expanded_bytes > MAX_EXPANDED_BYTES {
+            if expanded_bytes > extracted_limit {
                 return Err(archive_security_error(
                     "archive expands beyond the configured limit",
                 ));
@@ -480,12 +511,23 @@ fn extract_tar_xz(archive: &Path, staging: &Path, spec: &ArchiveSpec) -> Samdebu
                 .create_new(true)
                 .open(&output)
                 .map_err(|error| io_error("ARCHIVE_DUPLICATE_OR_WRITE_FAILED", &error))?;
-            std::io::copy(&mut entry, &mut file)
-                .map_err(|error| io_error("ARCHIVE_WRITE_FAILED", &error))?;
+            copy_cancellable(&mut entry, &mut file, cancellation)?;
             set_mode(&output, entry.header().mode().unwrap_or(0o644) & 0o777)?;
         }
         for (output, target) in pending_hard_links {
-            materialize_hard_link(&target, &output)?;
+            check_cancelled(cancellation)?;
+            let target_size = fs::symlink_metadata(&target)
+                .map_err(|_| archive_security_error("hard-link target is missing"))?
+                .len();
+            expanded_bytes = expanded_bytes
+                .checked_add(target_size)
+                .ok_or_else(|| archive_security_error("archive size overflow"))?;
+            if expanded_bytes > extracted_limit {
+                return Err(archive_security_error(
+                    "archive expands beyond the configured limit",
+                ));
+            }
+            materialize_hard_link(&target, &output, cancellation)?;
         }
         Ok(())
     })();
@@ -493,7 +535,39 @@ fn extract_tar_xz(archive: &Path, staging: &Path, spec: &ArchiveSpec) -> Samdebu
     result
 }
 
-fn materialize_hard_link(target: &Path, output: &Path) -> SamdebugResult<()> {
+fn decompress_xz(
+    archive: &Path,
+    tar_path: &Path,
+    cancellation: &CancellationToken,
+) -> SamdebugResult<()> {
+    let mut compressed = BufReader::new(
+        File::open(archive).map_err(|error| io_error("ARCHIVE_OPEN_FAILED", &error))?,
+    );
+    let expanded_file = BufWriter::new(
+        File::create(tar_path).map_err(|error| io_error("ARCHIVE_TEMP_FAILED", &error))?,
+    );
+    let mut expanded = LimitedWriter::new(expanded_file, MAX_EXPANDED_BYTES, cancellation);
+    lzma_rs::xz_decompress(&mut compressed, &mut expanded).map_err(|error| {
+        if cancellation.is_cancelled() {
+            interrupted_error()
+        } else {
+            SamdebugError::new(
+                ErrorCategory::Tool,
+                "ARCHIVE_DECOMPRESSION_FAILED",
+                error.to_string(),
+            )
+        }
+    })?;
+    expanded
+        .flush()
+        .map_err(|error| io_error("ARCHIVE_TEMP_FAILED", &error))
+}
+
+fn materialize_hard_link(
+    target: &Path,
+    output: &Path,
+    cancellation: &CancellationToken,
+) -> SamdebugResult<()> {
     let metadata = fs::symlink_metadata(target)
         .map_err(|_| archive_security_error("hard-link target is missing"))?;
     if !metadata.is_file() || metadata.file_type().is_symlink() || output.exists() {
@@ -509,8 +583,7 @@ fn materialize_hard_link(target: &Path, output: &Path) -> SamdebugResult<()> {
         .create_new(true)
         .open(output)
         .map_err(|error| io_error("ARCHIVE_DUPLICATE_OR_WRITE_FAILED", &error))?;
-    std::io::copy(&mut source, &mut destination)
-        .map_err(|error| io_error("ARCHIVE_WRITE_FAILED", &error))?;
+    copy_cancellable(&mut source, &mut destination, cancellation)?;
     fs::set_permissions(output, metadata.permissions())
         .map_err(|error| io_error("FILE_MODE_FAILED", &error))
 }
@@ -520,20 +593,28 @@ struct LimitedWriter<W> {
     inner: W,
     written: u64,
     limit: u64,
+    cancellation: CancellationToken,
 }
 
 impl<W> LimitedWriter<W> {
-    fn new(inner: W, limit: u64) -> Self {
+    fn new(inner: W, limit: u64, cancellation: &CancellationToken) -> Self {
         Self {
             inner,
             written: 0,
             limit,
+            cancellation: cancellation.clone(),
         }
     }
 }
 
 impl<W: Write> Write for LimitedWriter<W> {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if self.cancellation.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "operation interrupted",
+            ));
+        }
         let requested = u64::try_from(buffer.len()).unwrap_or(u64::MAX);
         if self.written.saturating_add(requested) > self.limit {
             return Err(std::io::Error::other("expanded archive exceeds size limit"));
@@ -565,8 +646,13 @@ fn strip_archive_root(path: &Path, root: &str) -> SamdebugResult<PathBuf> {
         .map_err(|_| archive_security_error("archive entry is outside the declared root"))
 }
 
-fn validate_staged(staging: &Path, artifact: &ToolArtifact) -> SamdebugResult<()> {
+fn validate_staged(
+    staging: &Path,
+    artifact: &ToolArtifact,
+    cancellation: &CancellationToken,
+) -> SamdebugResult<()> {
     for executable in &artifact.executables {
+        check_cancelled(cancellation)?;
         let path = staging.join(&executable.path);
         let metadata = fs::symlink_metadata(&path).map_err(|_| {
             SamdebugError::new(
@@ -593,6 +679,7 @@ fn validate_staged(staging: &Path, artifact: &ToolArtifact) -> SamdebugResult<()
         }
     }
     for license in &artifact.licenses {
+        check_cancelled(cancellation)?;
         if !staging.join(&license.path).is_file() {
             return Err(SamdebugError::new(
                 ErrorCategory::Tool,
@@ -604,12 +691,16 @@ fn validate_staged(staging: &Path, artifact: &ToolArtifact) -> SamdebugResult<()
     Ok(())
 }
 
-fn validate_executable_versions(staging: &Path, artifact: &ToolArtifact) -> SamdebugResult<()> {
+fn validate_executable_versions(
+    staging: &Path,
+    artifact: &ToolArtifact,
+    cancellation: &CancellationToken,
+) -> SamdebugResult<()> {
     for executable in &artifact.executables {
-        let output = Command::new(staging.join(&executable.path))
-            .args(&executable.version_args)
-            .output()
-            .map_err(|error| io_error("EXECUTABLE_VERSION_FAILED", &error))?;
+        check_cancelled(cancellation)?;
+        let mut command = Command::new(staging.join(&executable.path));
+        command.args(&executable.version_args);
+        let output = command_output_cancellable(&mut command, cancellation)?;
         let combined = format!(
             "{}{}",
             String::from_utf8_lossy(&output.stdout),
@@ -633,6 +724,15 @@ pub(crate) fn install_is_valid(
     destination: &Path,
     artifact: &ToolArtifact,
 ) -> SamdebugResult<bool> {
+    install_is_valid_with_cancellation(destination, artifact, &CancellationToken::new())
+}
+
+fn install_is_valid_with_cancellation(
+    destination: &Path,
+    artifact: &ToolArtifact,
+    cancellation: &CancellationToken,
+) -> SamdebugResult<bool> {
+    check_cancelled(cancellation)?;
     let marker_path = destination.join("install.json");
     if !marker_path.is_file() {
         return Ok(false);
@@ -643,14 +743,91 @@ pub(crate) fn install_is_valid(
     .map_err(|error| {
         SamdebugError::new(ErrorCategory::Tool, "MARKER_INVALID", error.to_string())
     })?;
-    if marker.schema_version != 1
+    if marker.schema_version != 2
         || marker.name != artifact.name
         || marker.version != artifact.version
         || marker.archive_sha256 != artifact.sha256
     {
         return Ok(false);
     }
-    validate_staged(destination, artifact).map(|()| true)
+    validate_staged(destination, artifact, cancellation)?;
+    if inventory_tree(destination, cancellation)? != marker.files {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn inventory_tree(
+    root: &Path,
+    cancellation: &CancellationToken,
+) -> SamdebugResult<Vec<InstalledFile>> {
+    let mut paths = Vec::new();
+    collect_tree_paths(root, root, &mut paths, cancellation)?;
+    paths.sort();
+    let mut files = Vec::with_capacity(paths.len());
+    for relative in paths {
+        check_cancelled(cancellation)?;
+        let path = root.join(&relative);
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| io_error("INSTALL_INTEGRITY_SCAN_FAILED", &error))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(archive_security_error(
+                "installed tree contains an unsafe entry",
+            ));
+        }
+        let path_text = relative
+            .to_str()
+            .ok_or_else(|| archive_security_error("installed path is not UTF-8"))?
+            .to_owned();
+        files.push(InstalledFile {
+            path: path_text,
+            size: metadata.len(),
+            sha256: sha256_file_with_cancellation(&path, cancellation)?,
+        });
+    }
+    Ok(files)
+}
+
+fn collect_tree_paths(
+    root: &Path,
+    current: &Path,
+    paths: &mut Vec<PathBuf>,
+    cancellation: &CancellationToken,
+) -> SamdebugResult<()> {
+    check_cancelled(cancellation)?;
+    let mut entries = fs::read_dir(current)
+        .map_err(|error| io_error("INSTALL_INTEGRITY_SCAN_FAILED", &error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| io_error("INSTALL_INTEGRITY_SCAN_FAILED", &error))?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        check_cancelled(cancellation)?;
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(root)
+            .expect("walked path is below root")
+            .to_path_buf();
+        if relative == Path::new("install.json") {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| io_error("INSTALL_INTEGRITY_SCAN_FAILED", &error))?;
+        if metadata.file_type().is_symlink() {
+            return Err(archive_security_error(
+                "installed tree contains a symbolic link",
+            ));
+        }
+        if metadata.is_dir() {
+            collect_tree_paths(root, &path, paths, cancellation)?;
+        } else if metadata.is_file() {
+            paths.push(relative);
+        } else {
+            return Err(archive_security_error(
+                "installed tree contains a special entry",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn write_new(path: &Path, bytes: &[u8], mode: u32) -> SamdebugResult<()> {
@@ -679,10 +856,18 @@ fn set_mode(_path: &Path, _mode: u32) -> SamdebugResult<()> {
 }
 
 pub(crate) fn sha256_file(path: &Path) -> SamdebugResult<String> {
+    sha256_file_with_cancellation(path, &CancellationToken::new())
+}
+
+fn sha256_file_with_cancellation(
+    path: &Path,
+    cancellation: &CancellationToken,
+) -> SamdebugResult<String> {
     let mut file = File::open(path).map_err(|error| io_error("HASH_OPEN_FAILED", &error))?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
+        check_cancelled(cancellation)?;
         let count = file
             .read(&mut buffer)
             .map_err(|error| io_error("HASH_READ_FAILED", &error))?;
@@ -698,6 +883,74 @@ pub(crate) fn sha256_file(path: &Path) -> SamdebugResult<String> {
         encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     Ok(encoded)
+}
+
+fn copy_cancellable(
+    source: &mut dyn Read,
+    destination: &mut dyn Write,
+    cancellation: &CancellationToken,
+) -> SamdebugResult<u64> {
+    let mut copied = 0u64;
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        check_cancelled(cancellation)?;
+        let count = source
+            .read(&mut buffer)
+            .map_err(|error| io_error("ARCHIVE_READ_FAILED", &error))?;
+        if count == 0 {
+            return Ok(copied);
+        }
+        destination
+            .write_all(&buffer[..count])
+            .map_err(|error| io_error("ARCHIVE_WRITE_FAILED", &error))?;
+        copied = copied.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+    }
+}
+
+fn command_output_cancellable(
+    command: &mut Command,
+    cancellation: &CancellationToken,
+) -> SamdebugResult<Output> {
+    check_cancelled(cancellation)?;
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| io_error("EXECUTABLE_VERSION_FAILED", &error))?;
+    loop {
+        if cancellation.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(interrupted_error());
+        }
+        match child
+            .try_wait()
+            .map_err(|error| io_error("EXECUTABLE_VERSION_FAILED", &error))?
+        {
+            Some(_) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|error| io_error("EXECUTABLE_VERSION_FAILED", &error));
+            }
+            None => thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
+fn check_cancelled(cancellation: &CancellationToken) -> SamdebugResult<()> {
+    if cancellation.is_cancelled() {
+        Err(interrupted_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn interrupted_error() -> SamdebugError {
+    SamdebugError::new(
+        ErrorCategory::Interrupted,
+        "INTERRUPTED",
+        "operation interrupted",
+    )
 }
 
 fn nonce() -> SamdebugResult<u128> {
@@ -757,9 +1010,11 @@ impl Downloader for CurlDownloader {
         url: &str,
         allowed_hosts: &[String],
         destination: &Path,
+        cancellation: &CancellationToken,
     ) -> SamdebugResult<DownloadReceipt> {
         validate_download_url(url, allowed_hosts)?;
-        let output = Command::new("/usr/bin/curl")
+        let mut command = Command::new("/usr/bin/curl");
+        command
             .args([
                 "--fail",
                 "--silent",
@@ -774,9 +1029,18 @@ impl Downloader for CurlDownloader {
                 "--output",
             ])
             .arg(destination)
-            .args(["--write-out", "%{url_effective}", url])
-            .output()
-            .map_err(|error| io_error("DOWNLOAD_START_FAILED", &error))?;
+            .args(["--write-out", "%{url_effective}", url]);
+        let output = command_output_cancellable(&mut command, cancellation).map_err(|error| {
+            if error.category() == ErrorCategory::Interrupted {
+                error
+            } else {
+                SamdebugError::new(
+                    ErrorCategory::Tool,
+                    "DOWNLOAD_START_FAILED",
+                    error.to_string(),
+                )
+            }
+        })?;
         if !output.status.success() {
             return Err(SamdebugError::new(
                 ErrorCategory::Tool,
@@ -803,18 +1067,18 @@ mod tests {
         io::Cursor,
         path::{Path, PathBuf},
         process::Command,
-        sync::Mutex,
+        sync::{Mutex, OnceLock},
     };
 
     use samdebug_core::{
-        SamdebugResult,
+        CancellationToken, SamdebugResult,
         ports::{DownloadReceipt, Downloader},
     };
     use tempfile::TempDir;
 
     use super::{
         ArchiveSpec, ExecutableSpec, InstallReport, Installer, LicenseSpec, Platform, ToolArtifact,
-        ToolManifest, sha256_file,
+        ToolManifest, extract_tar_xz_with_limit, sha256_file,
     };
 
     #[derive(Debug)]
@@ -836,6 +1100,7 @@ mod tests {
             _url: &str,
             _allowed_hosts: &[String],
             destination: &Path,
+            _cancellation: &CancellationToken,
         ) -> SamdebugResult<DownloadReceipt> {
             *self.calls.lock().expect("lock") += 1;
             fs::copy(&self.source, destination).expect("copy fixture archive");
@@ -903,6 +1168,38 @@ mod tests {
         fs::write(path, compressed).expect("write fixture");
     }
 
+    fn write_hard_link_archive(path: &Path, targets: &[&str]) {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            let bytes = vec![b'x'; 1024];
+            let mut file = tar::Header::new_gnu();
+            file.set_size(bytes.len() as u64);
+            file.set_mode(0o644);
+            file.set_entry_type(tar::EntryType::file());
+            file.set_cksum();
+            builder
+                .append_data(&mut file, "bundle/data", bytes.as_slice())
+                .expect("append hard-link target");
+            for (index, target) in targets.iter().enumerate() {
+                let mut link = tar::Header::new_gnu();
+                link.set_size(0);
+                link.set_mode(0o644);
+                link.set_entry_type(tar::EntryType::hard_link());
+                link.set_link_name(target).expect("hard-link target name");
+                link.set_cksum();
+                builder
+                    .append_data(&mut link, format!("bundle/link-{index}"), Cursor::new([]))
+                    .expect("append hard link");
+            }
+            builder.finish().expect("finish tar");
+        }
+        let mut compressed = Vec::new();
+        lzma_rs::xz_compress(&mut Cursor::new(tar_bytes), &mut compressed)
+            .expect("compress fixture");
+        fs::write(path, compressed).expect("write fixture");
+    }
+
     fn artifact(archive: &Path) -> ToolArtifact {
         ToolArtifact {
             name: "fixture-tool".into(),
@@ -951,7 +1248,13 @@ mod tests {
                 architecture: "aarch64".into(),
             },
             downloader,
+            test_token(),
         )
+    }
+
+    fn test_token() -> &'static CancellationToken {
+        static TOKEN: OnceLock<CancellationToken> = OnceLock::new();
+        TOKEN.get_or_init(CancellationToken::new)
     }
 
     fn setup_fixture(hostile: Option<&str>, license: bool, version: &str) -> (TempDir, PathBuf) {
@@ -1111,6 +1414,7 @@ mod tests {
                 architecture: "x86_64".into(),
             },
             &valid,
+            test_token(),
         );
         let error = windows
             .install(&manifest(artifact(&archive)), false)
@@ -1135,6 +1439,116 @@ mod tests {
                 .expect_err("reject invalid bundle");
             assert_eq!(error.code(), expected);
         }
+    }
+
+    #[test]
+    fn hard_links_are_materialized_safely_and_charged_to_quota() {
+        let temp = TempDir::new().expect("tempdir");
+        let safe_archive = temp.path().join("safe-links.tar.xz");
+        write_hard_link_archive(&safe_archive, &["bundle/data"]);
+        let safe_stage = temp.path().join("safe-stage");
+        fs::create_dir(&safe_stage).expect("safe staging");
+        extract_tar_xz_with_limit(
+            &safe_archive,
+            &safe_stage,
+            &ArchiveSpec {
+                kind: "tar.xz".into(),
+                root: "bundle".into(),
+            },
+            test_token(),
+            2048,
+        )
+        .expect("one hard link fits quota");
+        assert_eq!(
+            fs::read(safe_stage.join("data")).expect("target"),
+            vec![b'x'; 1024]
+        );
+        assert_eq!(
+            fs::read(safe_stage.join("link-0")).expect("copy"),
+            vec![b'x'; 1024]
+        );
+
+        let quota_stage = temp.path().join("quota-stage");
+        fs::create_dir(&quota_stage).expect("quota staging");
+        let error = extract_tar_xz_with_limit(
+            &safe_archive,
+            &quota_stage,
+            &ArchiveSpec {
+                kind: "tar.xz".into(),
+                root: "bundle".into(),
+            },
+            test_token(),
+            1024,
+        )
+        .expect_err("hard-link copy exceeds quota");
+        assert_eq!(error.code(), "UNSAFE_ARCHIVE");
+
+        let missing_archive = temp.path().join("missing-link.tar.xz");
+        write_hard_link_archive(&missing_archive, &["bundle/missing"]);
+        let missing_stage = temp.path().join("missing-stage");
+        fs::create_dir(&missing_stage).expect("missing staging");
+        let error = extract_tar_xz_with_limit(
+            &missing_archive,
+            &missing_stage,
+            &ArchiveSpec {
+                kind: "tar.xz".into(),
+                root: "bundle".into(),
+            },
+            test_token(),
+            4096,
+        )
+        .expect_err("missing hard-link target rejected");
+        assert_eq!(error.code(), "UNSAFE_ARCHIVE");
+
+        for (name, targets) in [
+            ("external", vec!["outside/data"]),
+            ("chained", vec!["bundle/link-1", "bundle/data"]),
+        ] {
+            let archive = temp.path().join(format!("{name}-link.tar.xz"));
+            write_hard_link_archive(&archive, &targets);
+            let stage = temp.path().join(format!("{name}-stage"));
+            fs::create_dir(&stage).expect("link staging");
+            let error = extract_tar_xz_with_limit(
+                &archive,
+                &stage,
+                &ArchiveSpec {
+                    kind: "tar.xz".into(),
+                    root: "bundle".into(),
+                },
+                test_token(),
+                8192,
+            )
+            .expect_err("unsafe hard link rejected");
+            assert_eq!(error.code(), "UNSAFE_ARCHIVE");
+        }
+    }
+
+    #[test]
+    fn installed_tree_hashes_detect_tampering_and_restore_from_cache() {
+        let (temp, archive) = setup_fixture(None, true, "1.0");
+        let root = temp.path().join("managed");
+        let downloader = FakeDownloader {
+            source: archive.clone(),
+            final_url: "https://downloads.example.test/tool.tar.xz".into(),
+            calls: Mutex::new(0),
+        };
+        let artifact = artifact(&archive);
+        let manifest = manifest(artifact.clone());
+        installer(&root, &downloader)
+            .install(&manifest, false)
+            .expect("initial install");
+        let installed = root.join("tools/fixture-tool/1.0");
+        fs::write(installed.join("LICENSE"), b"tampered").expect("tamper license");
+        assert!(!super::install_is_valid(&installed, &artifact).expect("integrity result"));
+
+        let repaired = installer(&root, &downloader)
+            .install(&manifest, true)
+            .expect("repair from verified cache");
+        assert_eq!(repaired.installed, ["fixture-tool@1.0"]);
+        assert_eq!(
+            fs::read(installed.join("LICENSE")).expect("restored license"),
+            b"fixture license"
+        );
     }
 
     #[test]

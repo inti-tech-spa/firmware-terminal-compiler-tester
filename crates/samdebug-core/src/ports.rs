@@ -2,7 +2,7 @@
 
 use std::{path::Path, time::Duration};
 
-use crate::SamdebugResult;
+use crate::{CancellationToken, SamdebugResult};
 
 pub trait FileSystem: std::fmt::Debug + Send + Sync {
     fn read_to_string(&self, path: &Path) -> SamdebugResult<String>;
@@ -19,6 +19,7 @@ pub trait Downloader: std::fmt::Debug + Send + Sync {
         url: &str,
         allowed_hosts: &[String],
         destination: &Path,
+        cancellation: &CancellationToken,
     ) -> SamdebugResult<DownloadReceipt>;
 }
 

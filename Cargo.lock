@@ -586,6 +586,7 @@ dependencies = [
  "samdebug-tui",
  "serde",
  "serde_json",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]

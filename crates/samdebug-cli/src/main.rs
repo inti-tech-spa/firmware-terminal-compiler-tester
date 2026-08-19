@@ -2,12 +2,12 @@ use std::{ffi::OsString, path::PathBuf, process::ExitCode, time::Duration};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use samdebug_core::{
-    CancellationToken, ErrorCategory, FiniteResult, SamdebugError,
-    ports::{CommandSpec, ProcessRunner},
+    CancellationToken, ErrorCategory, FiniteResult, SamdebugConfig, SamdebugError, SamdebugResult,
+    ports::{CommandSpec, DownloadReceipt, Downloader, FileSystem, ProcessRunner},
 };
 use samdebug_tools::{
     ChildSupervisor, CurlDownloader, Installer, MacUsbProbeProvider, Platform, SystemProcessRunner,
-    ToolManifest, run_doctor,
+    ToolManifest, run_doctor, run_system_doctor,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -52,6 +52,8 @@ enum Command {
     Debug(DebugArgs),
     #[command(name = "__test-block", hide = true)]
     InternalTestBlock,
+    #[command(name = "__test-setup-cancel", hide = true)]
+    InternalTestSetupCancel,
 }
 
 #[derive(Debug, Args)]
@@ -203,7 +205,7 @@ fn dispatch(
             })
             .expect("version serializes"),
         )),
-        Command::Setup { offline } => setup_command(*offline)
+        Command::Setup { offline } => setup_command(*offline, cancellation)
             .map(|report| {
                 (
                     "setup",
@@ -227,6 +229,14 @@ fn dispatch(
         Command::InternalTestBlock => run_internal_blocking_test(cancellation)
             .map(|code| ("__test-block", json!({"child_exit_code": code})))
             .map_err(|error| ("__test-block", error)),
+        Command::InternalTestSetupCancel => run_internal_setup_cancel(cancellation)
+            .map(|report| {
+                (
+                    "__test-setup-cancel",
+                    serde_json::to_value(report).expect("report serializes"),
+                )
+            })
+            .map_err(|error| ("__test-setup-cancel", error)),
         command => Err((
             command_name(command),
             SamdebugError::new(
@@ -238,13 +248,33 @@ fn dispatch(
     }
 }
 
-fn setup_command(offline: bool) -> Result<samdebug_tools::InstallReport, SamdebugError> {
+fn setup_command(
+    offline: bool,
+    cancellation: &CancellationToken,
+) -> Result<samdebug_tools::InstallReport, SamdebugError> {
     let manifest = embedded_manifest()?;
-    Installer::new(managed_root()?, Platform::current(), &CurlDownloader)
-        .install(&manifest, offline)
+    Installer::new(
+        managed_root()?,
+        Platform::current(),
+        &CurlDownloader,
+        cancellation,
+    )
+    .install(&manifest, offline)
 }
 
 fn doctor_command() -> Result<samdebug_tools::DoctorReport, SamdebugError> {
+    let config_path = PathBuf::from("samdebug.toml");
+    if config_path.is_file() {
+        let loaded = SamdebugConfig::load(&LocalFileSystem, &config_path)?;
+        if let Some(system) = loaded.config.tools.system.as_ref() {
+            return run_system_doctor(
+                system,
+                &Platform::current(),
+                &MacUsbProbeProvider,
+                &SystemProcessRunner,
+            );
+        }
+    }
     let manifest = embedded_manifest()?;
     run_doctor(
         &manifest,
@@ -253,6 +283,21 @@ fn doctor_command() -> Result<samdebug_tools::DoctorReport, SamdebugError> {
         &MacUsbProbeProvider,
         &SystemProcessRunner,
     )
+}
+
+#[derive(Debug)]
+struct LocalFileSystem;
+
+impl FileSystem for LocalFileSystem {
+    fn read_to_string(&self, path: &std::path::Path) -> SamdebugResult<String> {
+        std::fs::read_to_string(path).map_err(|error| {
+            SamdebugError::new(
+                ErrorCategory::Command,
+                "CONFIG_READ_FAILED",
+                error.to_string(),
+            )
+        })
+    }
 }
 
 fn embedded_manifest() -> Result<ToolManifest, SamdebugError> {
@@ -319,7 +364,106 @@ fn command_name(command: &Command) -> &'static str {
         Command::Flash(_) => "flash",
         Command::Debug(_) => "debug",
         Command::InternalTestBlock => "__test-block",
+        Command::InternalTestSetupCancel => "__test-setup-cancel",
     }
+}
+
+#[derive(Debug)]
+struct SlowTestDownloader {
+    ready_file: PathBuf,
+}
+
+impl Downloader for SlowTestDownloader {
+    fn download(
+        &self,
+        _url: &str,
+        _allowed_hosts: &[String],
+        destination: &std::path::Path,
+        cancellation: &CancellationToken,
+    ) -> SamdebugResult<DownloadReceipt> {
+        std::fs::write(destination, b"partial").map_err(|error| {
+            SamdebugError::new(
+                ErrorCategory::Tool,
+                "TEST_DOWNLOAD_FAILED",
+                error.to_string(),
+            )
+        })?;
+        std::fs::write(&self.ready_file, b"ready").map_err(|error| {
+            SamdebugError::new(ErrorCategory::Tool, "TEST_READY_FAILED", error.to_string())
+        })?;
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(SamdebugError::new(
+                    ErrorCategory::Interrupted,
+                    "INTERRUPTED",
+                    "operation interrupted",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+fn run_internal_setup_cancel(
+    cancellation: &CancellationToken,
+) -> Result<samdebug_tools::InstallReport, SamdebugError> {
+    let root = PathBuf::from(std::env::var_os("SAMDEBUG_TEST_SETUP_ROOT").ok_or_else(|| {
+        SamdebugError::new(
+            ErrorCategory::Command,
+            "TEST_ROOT_MISSING",
+            "test root is required",
+        )
+    })?);
+    let ready_file = PathBuf::from(
+        std::env::var_os("SAMDEBUG_TEST_SETUP_READY_FILE").ok_or_else(|| {
+            SamdebugError::new(
+                ErrorCategory::Command,
+                "TEST_READY_MISSING",
+                "test ready file is required",
+            )
+        })?,
+    );
+    let artifact = samdebug_tools::ToolArtifact {
+        name: "cancel-fixture".into(),
+        version: "1".into(),
+        os: std::env::consts::OS.into(),
+        architecture: std::env::consts::ARCH.into(),
+        url: "https://downloads.example.test/cancel.tar.xz".into(),
+        allowed_hosts: vec!["downloads.example.test".into()],
+        sha256: "0".repeat(64),
+        archive: samdebug_tools::ArchiveSpec {
+            kind: "tar.xz".into(),
+            root: "bundle".into(),
+        },
+        executables: vec![samdebug_tools::ExecutableSpec {
+            name: "fixture".into(),
+            path: "bin/fixture".into(),
+            version_args: vec!["--version".into()],
+            version_contains: "fixture".into(),
+        }],
+        licenses: vec![samdebug_tools::LicenseSpec {
+            spdx: "MIT".into(),
+            path: "LICENSE".into(),
+        }],
+        source_url: "https://sources.example.test/cancel.tar.xz".into(),
+        source_sha256: "1".repeat(64),
+        source_offer: "accompanying-source".into(),
+    };
+    let manifest = ToolManifest {
+        schema_version: 1,
+        channel: "pinned".into(),
+        installable: true,
+        reason: None,
+        required_tools: vec!["cancel-fixture".into()],
+        artifacts: vec![artifact],
+    };
+    Installer::new(
+        root,
+        Platform::current(),
+        &SlowTestDownloader { ready_file },
+        cancellation,
+    )
+    .install(&manifest, false)
 }
 
 fn run_internal_blocking_test(cancellation: &CancellationToken) -> Result<i32, SamdebugError> {

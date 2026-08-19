@@ -9,8 +9,12 @@ verifies SHA-256 before decompression, extracts into a new staging directory,
 validates paths, entry types, executable versions, and license files, writes an
 install marker, then atomically renames the tree into place. Symbolic links and
 special files are rejected. Internal archive hard links are validated and
-materialized as regular-file copies. Interrupted staging and partial-download
-files are removed on the next setup run.
+materialized as regular-file copies whose bytes count against the extraction
+quota. The versioned install marker records the size and SHA-256 of every file;
+reuse and doctor recompute the complete inventory so modified libraries, Tcl
+scripts, notices, or executables are rejected. Interrupted downloads,
+decompression, extraction, hashing, validation, and version checks return exit
+130, terminate the active downloader, and remove partial state immediately.
 
 `samdebug setup --offline` never accesses the network. It reuses an already
 verified installation or a cache archive whose current hash matches the
@@ -24,7 +28,9 @@ uses CMSIS-DAP through the operating system's USB/HID support.
 
 System tools are accepted only when `samdebug.toml` explicitly selects
 `channel = "system"` and provides absolute paths for GCC, GDB, OpenOCD,
-objcopy, objdump, and size. The generated default remains `channel = "pinned"`.
+objcopy, objdump, and size. Doctor loads that configuration, runs every tool's
+version check, and warns that the override is not reproducible. The generated
+default remains `channel = "pinned"`.
 
 ## Current publication gate
 
