@@ -1,0 +1,48 @@
+# M04 audit — attempt 1
+
+Verdict: **REJECTED**
+
+- Audited commit: `51e73fb9f304e41227ad22c9161badea5314c21a`
+- Audit task identity: `/root/audit_plan`
+- Environment: macOS 26.5.2 arm64
+- Rust: rustc/cargo 1.97.1
+- Arm GNU Toolchain: 15.2.Rel1, GCC 15.2.1, binutils 2.45.1
+- cargo-deny: 0.20.2
+- cargo-audit: 0.22.2
+
+## Passing evidence
+
+- 51 clean locked tests passed and two installer archive tests were ignored.
+- Formatting, strict Clippy, cargo-deny, and cargo-audit passed.
+- Clean real Debug and Release builds compiled 35 sources and generated all
+  requested artifacts. Incremental rebuilds reused all objects and a touched
+  header rebuilt only its four consumers.
+- The outputs are ELF32 ARM EABI5 armv7e-m soft-float images with valid flash
+  entries and memory usage. The original firmware repository and `.cproj` hash
+  remained unchanged.
+
+## Blocking findings
+
+1. Unsafe imported compiler flags could direct assembler output outside
+   `.samdebug` and could also select response files, hooks, plugins, alternate
+   outputs, or conflicting target flags.
+2. A pre-created hard-linked map output caused the linker to overwrite an
+   external sentinel.
+3. Active compiler children were not cancelled by SIGINT and the command did
+   not return exit 130.
+4. Incremental fingerprints omitted compiler identity, allowing objects from a
+   different compiler to be reused.
+5. Expected outputs were not verified after exit-zero tools and ELF validation
+   did not enforce architecture, EABI, Thumb/Cortex-M4, and soft-float.
+
+## Required remediation
+
+- Enforce a closed safe policy for imported flags.
+- Write tool outputs to private staging paths, validate them, then promote them
+  without following links.
+- Supervise, cancel, and reap all build children.
+- Include immutable compiler identity in object fingerprints.
+- Validate every expected artifact and the full target ABI, with regression
+  tests for all demonstrated exploits.
+
+M05 remains blocked until remediation is independently approved.
