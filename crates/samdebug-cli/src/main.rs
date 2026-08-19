@@ -6,7 +6,7 @@ use samdebug_core::{
     SamdebugResult,
     ports::{CommandSpec, DownloadReceipt, Downloader, FileSystem, ProcessRunner},
 };
-use samdebug_project::initialize_project;
+use samdebug_project::{BuildToolPaths, artifacts, build, clean, initialize_project};
 use samdebug_tools::{
     ChildSupervisor, CurlDownloader, Installer, MacUsbProbeProvider, Platform, SystemProcessRunner,
     ToolManifest, run_doctor, run_system_doctor,
@@ -184,6 +184,7 @@ fn requested_output(args: &[OsString]) -> OutputFormat {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn dispatch(
     cli: &Cli,
     cancellation: &CancellationToken,
@@ -238,6 +239,32 @@ fn dispatch(
                 })
                 .map_err(|error| ("init", error))
         }
+        Command::Build => build_command(cancellation)
+            .map(|report| {
+                (
+                    "build",
+                    serde_json::to_value(report).expect("build report serializes"),
+                )
+            })
+            .map_err(|error| ("build", error)),
+        Command::Clean => project_command_context()
+            .and_then(|(root, config)| clean(&root, config.project.configuration))
+            .map(|report| {
+                (
+                    "clean",
+                    serde_json::to_value(report).expect("clean report serializes"),
+                )
+            })
+            .map_err(|error| ("clean", error)),
+        Command::Artifacts => project_command_context()
+            .and_then(|(root, config)| artifacts(&root, config.project.configuration))
+            .map(|report| {
+                (
+                    "artifacts",
+                    serde_json::to_value(report).expect("artifacts report serializes"),
+                )
+            })
+            .map_err(|error| ("artifacts", error)),
         Command::Debug(args) if !args.agent => samdebug_tui::run()
             .map(|()| ("debug", json!({})))
             .map_err(|error| ("debug", error)),
@@ -263,6 +290,52 @@ fn dispatch(
             ),
         )),
     }
+}
+
+fn build_command(
+    cancellation: &CancellationToken,
+) -> Result<samdebug_project::BuildReport, SamdebugError> {
+    let (root, config) = project_command_context()?;
+    let project_file = root.join(&config.project.path);
+    let tools = resolve_build_tools(&config)?;
+    build(
+        &project_file,
+        config.project.configuration,
+        &tools,
+        &SystemProcessRunner,
+        cancellation,
+    )
+}
+
+fn project_command_context() -> Result<(PathBuf, SamdebugConfig), SamdebugError> {
+    let root = std::env::current_dir().map_err(|error| {
+        SamdebugError::new(
+            ErrorCategory::Command,
+            "CURRENT_DIRECTORY_FAILED",
+            error.to_string(),
+        )
+    })?;
+    let loaded = SamdebugConfig::load(&LocalFileSystem, &root.join("samdebug.toml"))?;
+    Ok((root, loaded.config))
+}
+
+fn resolve_build_tools(config: &SamdebugConfig) -> Result<BuildToolPaths, SamdebugError> {
+    if let Some(system) = config.tools.system.as_ref() {
+        return Ok(BuildToolPaths {
+            gcc: system.gcc.clone(),
+            objcopy: system.objcopy.clone(),
+            objdump: system.objdump.clone(),
+            size: system.size.clone(),
+        });
+    }
+    let bin = managed_root()?.join("tools/arm-gnu-toolchain/15.2.Rel1/bin");
+    let path = |name: &str| bin.join(name).to_string_lossy().into_owned();
+    Ok(BuildToolPaths {
+        gcc: path("arm-none-eabi-gcc"),
+        objcopy: path("arm-none-eabi-objcopy"),
+        objdump: path("arm-none-eabi-objdump"),
+        size: path("arm-none-eabi-size"),
+    })
 }
 
 fn setup_command(

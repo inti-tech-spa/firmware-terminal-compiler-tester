@@ -81,3 +81,49 @@ pub struct InitReport {
     pub sources: usize,
     pub warnings: Vec<ImportWarning>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildToolPaths {
+    pub gcc: String,
+    pub objcopy: String,
+    pub objdump: String,
+    pub size: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryUsage {
+    pub flash_bytes: u64,
+    pub flash_limit: u64,
+    pub ram_bytes: u64,
+    pub ram_limit: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildReport {
+    pub configuration: String,
+    pub compiled: usize,
+    pub reused: usize,
+    pub elf: String,
+    pub artifacts: Vec<String>,
+    pub entry_point: u64,
+    pub memory: MemoryUsage,
+    pub warnings: Vec<ImportWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanReport {
+    pub removed: bool,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactInfo {
+    pub path: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactsReport {
+    pub configuration: String,
+    pub artifacts: Vec<ArtifactInfo>,
+}
