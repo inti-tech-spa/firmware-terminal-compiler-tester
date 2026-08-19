@@ -133,10 +133,27 @@
       "required": ["schema_version", "kind", "event", "payload"],
       "properties": {
         "schema_version": { "const": 1 }, "kind": { "const": "event" },
-        "event": { "enum": ["state", "running", "stopped", "reset", "loaded", "progress", "target.output", "log", "session.error", "cancelled"] },
+        "event": { "enum": ["probe.selected", "server.starting", "server.ready", "gdb.starting", "state", "running", "stopped", "reset", "loaded", "progress", "target.output", "log", "session.error", "session.stopped", "cancelled"] },
         "payload": { "type": "object" }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "allOf": [
+        { "if": { "$ref": "#/$defs/isProbeSelectedEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/probeSelectedEventPayload" } } } },
+        { "if": { "$ref": "#/$defs/isServerStartingEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/generationPayload" } } } },
+        { "if": { "$ref": "#/$defs/isServerReadyEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/serverReadyEventPayload" } } } },
+        { "if": { "$ref": "#/$defs/isGdbStartingEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/generationPayload" } } } },
+        { "if": { "$ref": "#/$defs/isStateEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/stateEventPayload" } } } },
+        { "if": { "$ref": "#/$defs/isRunningEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/generationPayload" } } } },
+        { "if": { "$ref": "#/$defs/isStoppedEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/stoppedEventPayload" } } } },
+        { "if": { "$ref": "#/$defs/isResetEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/generationPayload" } } } },
+        { "if": { "$ref": "#/$defs/isLoadedEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/loadedEventPayload" } } } },
+        { "if": { "$ref": "#/$defs/isProgressEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/progressEventPayload" } } } },
+        { "if": { "$ref": "#/$defs/isTargetOutputEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/targetOutputEventPayload" } } } },
+        { "if": { "$ref": "#/$defs/isLogEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/logEventPayload" } } } },
+        { "if": { "$ref": "#/$defs/isSessionErrorEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/sessionErrorEventPayload" } } } },
+        { "if": { "$ref": "#/$defs/isSessionStoppedEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/sessionStoppedEventPayload" } } } },
+        { "if": { "$ref": "#/$defs/isCancelledEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/cancelledEventPayload" } } } }
+      ]
     },
     "emptyPayload": { "type": "object", "additionalProperties": false },
     "sessionStartPayload": {
@@ -222,6 +239,67 @@
       "additionalProperties": false
     },
     "loadResult": { "type": "object", "required": ["state", "verified"], "properties": { "state": { "const": "halted" }, "verified": { "const": true } }, "additionalProperties": false },
+    "sessionState": { "enum": ["idle", "probe_selected", "server_starting", "server_ready", "gdb_starting", "connected", "halted", "running", "failed", "cancelling", "disconnecting"] },
+    "generationPayload": {
+      "type": "object", "required": ["generation"],
+      "properties": { "generation": { "type": "integer", "minimum": 1 } },
+      "additionalProperties": false
+    },
+    "probeSelectedEventPayload": {
+      "type": "object", "required": ["generation", "probe_serial"],
+      "properties": { "generation": { "type": "integer", "minimum": 1 }, "probe_serial": { "type": "string", "minLength": 1 } },
+      "additionalProperties": false
+    },
+    "serverReadyEventPayload": {
+      "type": "object", "required": ["generation", "gdb_port"],
+      "properties": { "generation": { "type": "integer", "minimum": 1 }, "gdb_port": { "type": "integer", "minimum": 1, "maximum": 65535 } },
+      "additionalProperties": false
+    },
+    "stateEventPayload": {
+      "type": "object", "required": ["generation", "previous", "current"],
+      "properties": { "generation": { "type": "integer", "minimum": 1 }, "previous": { "$ref": "#/$defs/sessionState" }, "current": { "$ref": "#/$defs/sessionState" } },
+      "additionalProperties": false
+    },
+    "stoppedEventPayload": {
+      "type": "object", "required": ["generation", "reason"],
+      "properties": { "generation": { "type": "integer", "minimum": 1 }, "reason": { "enum": ["breakpoint", "step", "halt", "reset", "signal", "watchpoint", "unknown"] }, "frame": { "$ref": "#/$defs/frame" } },
+      "additionalProperties": false
+    },
+    "loadedEventPayload": {
+      "type": "object", "required": ["generation", "verified"],
+      "properties": { "generation": { "type": "integer", "minimum": 1 }, "verified": { "const": true } },
+      "additionalProperties": false
+    },
+    "progressEventPayload": {
+      "type": "object", "required": ["generation", "operation", "completed", "total", "unit"],
+      "properties": { "generation": { "type": "integer", "minimum": 1 }, "operation": { "enum": ["firmware.load", "erase", "flash", "verify"] }, "completed": { "type": "integer", "minimum": 0 }, "total": { "type": "integer", "minimum": 1 }, "unit": { "enum": ["bytes", "steps"] } },
+      "additionalProperties": false
+    },
+    "targetOutputEventPayload": {
+      "type": "object", "required": ["generation", "stream", "text"],
+      "properties": { "generation": { "type": "integer", "minimum": 1 }, "stream": { "enum": ["stdout", "stderr"] }, "text": { "type": "string" } },
+      "additionalProperties": false
+    },
+    "logEventPayload": {
+      "type": "object", "required": ["generation", "level", "source", "text"],
+      "properties": { "generation": { "type": "integer", "minimum": 1 }, "level": { "enum": ["trace", "debug", "info", "warn", "error"] }, "source": { "enum": ["samdebug", "openocd", "gdb"] }, "text": { "type": "string" } },
+      "additionalProperties": false
+    },
+    "sessionErrorEventPayload": {
+      "type": "object", "required": ["generation", "code", "message", "recoverable"],
+      "properties": { "generation": { "type": "integer", "minimum": 1 }, "code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" }, "message": { "type": "string" }, "recoverable": { "type": "boolean" } },
+      "additionalProperties": false
+    },
+    "sessionStoppedEventPayload": {
+      "type": "object", "required": ["generation", "reason"],
+      "properties": { "generation": { "type": "integer", "minimum": 1 }, "reason": { "enum": ["requested", "error", "cancelled"] } },
+      "additionalProperties": false
+    },
+    "cancelledEventPayload": {
+      "type": "object", "required": ["generation", "operation"],
+      "properties": { "generation": { "type": "integer", "minimum": 1 }, "operation": { "type": "string", "minLength": 1 } },
+      "additionalProperties": false
+    },
     "isSessionStart": { "type": "object", "properties": { "operation": { "const": "session.start" } }, "required": ["operation"] },
     "isSessionStop": { "type": "object", "properties": { "operation": { "const": "session.stop" } }, "required": ["operation"] },
     "isTargetHalt": { "type": "object", "properties": { "operation": { "const": "target.halt" } }, "required": ["operation"] },
@@ -236,6 +314,21 @@
     "isRegistersRead": { "type": "object", "properties": { "operation": { "const": "registers.read" } }, "required": ["operation"] },
     "isMemoryRead": { "type": "object", "properties": { "operation": { "const": "memory.read" } }, "required": ["operation"] },
     "isFirmwareLoad": { "type": "object", "properties": { "operation": { "const": "firmware.load" } }, "required": ["operation"] },
+    "isProbeSelectedEvent": { "type": "object", "properties": { "event": { "const": "probe.selected" } }, "required": ["event"] },
+    "isServerStartingEvent": { "type": "object", "properties": { "event": { "const": "server.starting" } }, "required": ["event"] },
+    "isServerReadyEvent": { "type": "object", "properties": { "event": { "const": "server.ready" } }, "required": ["event"] },
+    "isGdbStartingEvent": { "type": "object", "properties": { "event": { "const": "gdb.starting" } }, "required": ["event"] },
+    "isStateEvent": { "type": "object", "properties": { "event": { "const": "state" } }, "required": ["event"] },
+    "isRunningEvent": { "type": "object", "properties": { "event": { "const": "running" } }, "required": ["event"] },
+    "isStoppedEvent": { "type": "object", "properties": { "event": { "const": "stopped" } }, "required": ["event"] },
+    "isResetEvent": { "type": "object", "properties": { "event": { "const": "reset" } }, "required": ["event"] },
+    "isLoadedEvent": { "type": "object", "properties": { "event": { "const": "loaded" } }, "required": ["event"] },
+    "isProgressEvent": { "type": "object", "properties": { "event": { "const": "progress" } }, "required": ["event"] },
+    "isTargetOutputEvent": { "type": "object", "properties": { "event": { "const": "target.output" } }, "required": ["event"] },
+    "isLogEvent": { "type": "object", "properties": { "event": { "const": "log" } }, "required": ["event"] },
+    "isSessionErrorEvent": { "type": "object", "properties": { "event": { "const": "session.error" } }, "required": ["event"] },
+    "isSessionStoppedEvent": { "type": "object", "properties": { "event": { "const": "session.stopped" } }, "required": ["event"] },
+    "isCancelledEvent": { "type": "object", "properties": { "event": { "const": "cancelled" } }, "required": ["event"] },
     "error": {
       "type": "object", "required": ["code", "message"],
       "properties": {

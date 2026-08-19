@@ -63,6 +63,13 @@ serial. The ELF is the artifact selected by `samdebug.toml`; v1 does not accept
 an arbitrary ELF path over the agent protocol. Memory reads are limited to
 65,536 bytes per request.
 
+Asynchronous events are also closed, normative schema variants. Session startup
+emits `probe.selected`, `server.starting`, `server.ready`, `gdb.starting`, state,
+and stopped events in order. Target execution emits running/stopped/reset;
+loading emits progress/loaded; termination emits session errors, cancellation,
+and `session.stopped` as applicable. Every session event carries its generation
+so consumers can discard stale records.
+
 ## Authorization
 
 `erase`, `flash`, `firmware.load`, memory writes, and raw monitor commands are
