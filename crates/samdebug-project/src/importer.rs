@@ -147,6 +147,7 @@ pub fn import_cproj(path: &Path, configuration: Configuration) -> SamdebugResult
         settings,
         "armgcc.compiler.directories.IncludePaths",
         project_root,
+        (&project_name, configuration_name),
         &mut warnings,
     )?;
     let assembler_include_directories = parse_include_paths(
@@ -155,6 +156,7 @@ pub fn import_cproj(path: &Path, configuration: Configuration) -> SamdebugResult
         settings,
         "armgcc.assembler.general.IncludePaths",
         project_root,
+        (&project_name, configuration_name),
         &mut warnings,
     )?;
     let (sources, headers) = parse_items(
@@ -163,8 +165,7 @@ pub fn import_cproj(path: &Path, configuration: Configuration) -> SamdebugResult
         root,
         project_root,
         &canonical_root,
-        &project_name,
-        configuration_name,
+        (&project_name, configuration_name),
     )?;
     let mut compiler_flags = tokenize_node(
         path,
@@ -545,8 +546,7 @@ fn parse_items(
     root: Node<'_, '_>,
     project_root: &Path,
     canonical_root: &Path,
-    project_name: &str,
-    configuration: &str,
+    macros: (&str, &str),
 ) -> SamdebugResult<(Vec<SourceInput>, Vec<String>)> {
     let mut sources = Vec::new();
     let mut headers = Vec::new();
@@ -564,14 +564,14 @@ fn parse_items(
                 "Compile item has no Include",
             )
         })?;
-        let expanded = expand_value(raw, project_name, configuration)
+        let expanded = expand_value(raw, macros.0, macros.1)
             .map_err(|error| expression_error(path, document, node, &error))?;
         let normalized = normalize_separators(&expanded);
         let link_node = node.children().find(|child| child.has_tag_name("Link"));
         let link_name = link_node
             .and_then(|child| child.text())
             .map(|value| {
-                expand_value(value, project_name, configuration)
+                expand_value(value, macros.0, macros.1)
                     .map(|expanded| normalize_separators(&expanded))
                     .map_err(|error| expression_error(path, document, link_node.unwrap(), &error))
             })
@@ -681,6 +681,7 @@ fn parse_include_paths(
     settings: Node<'_, '_>,
     tag: &str,
     project_root: &Path,
+    macros: (&str, &str),
     warnings: &mut Vec<ImportWarning>,
 ) -> SamdebugResult<Vec<String>> {
     let nodes = values_nodes(settings, tag);
@@ -691,7 +692,7 @@ fn parse_include_paths(
         if value.contains("%24(PackRepoDir)") || value.contains("$(PackRepoDir)") {
             vendor.push(node);
         } else {
-            let normalized = normalize_setting_path(value, "", "")
+            let normalized = normalize_setting_path(value, macros.0, macros.1)
                 .map_err(|error| expression_error(path, document, node, &error))?;
             if !project_root.join(&normalized).is_dir() {
                 return Err(node_error(
@@ -748,10 +749,9 @@ fn normalize_paths(
     for node in nodes {
         let value = expand_value(node.text().unwrap_or_default(), project_name, configuration)
             .map_err(|error| node_error(path, document, node, error.code(), error.to_string()))?;
-        push_unique(
-            &mut result,
-            normalize_setting_path(&value, project_name, configuration)?,
-        );
+        let normalized = normalize_setting_path(&value, project_name, configuration)
+            .map_err(|error| expression_error(path, document, node, &error))?;
+        push_unique(&mut result, normalized);
     }
     Ok(result)
 }

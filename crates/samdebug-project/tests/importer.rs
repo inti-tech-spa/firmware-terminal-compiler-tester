@@ -263,6 +263,44 @@ fn init_rejects_symlinked_state_directory_without_external_writes() {
 }
 
 #[test]
+fn expands_supported_macros_in_include_directories() {
+    let temp = copy_fixture();
+    let project = temp.path().join("valid");
+    fs::create_dir(project.join("include-Debug")).expect("macro include directory");
+    let path = project.join("project.cproj");
+    let text = fs::read_to_string(&path).expect("read fixture").replacen(
+        "../include dir",
+        "../include-$(Configuration)",
+        1,
+    );
+    fs::write(&path, text).expect("write macro fixture");
+    let imported = import_cproj(&path, Configuration::Debug).expect("expand include macro");
+    assert!(
+        imported
+            .plan
+            .include_directories
+            .contains(&"include-Debug".into())
+    );
+}
+
+#[test]
+fn unsafe_library_search_path_has_xml_location() {
+    let temp = copy_fixture();
+    let path = temp.path().join("valid/project.cproj");
+    let text =
+        fs::read_to_string(&path)
+            .expect("read fixture")
+            .replacen("../libs", "../../escape", 1);
+    fs::write(&path, text).expect("write unsafe library path");
+    let error = import_cproj(&path, Configuration::Debug).expect_err("reject path escape");
+    assert_eq!(error.code(), "UNSAFE_PROJECT_PATH");
+    let value = serde_json::to_value(error).expect("serialize error");
+    assert_eq!(value["details"]["element"], "Value");
+    assert!(value["details"]["line"].as_u64().is_some());
+    assert!(value["details"]["column"].as_u64().is_some());
+}
+
+#[test]
 fn imports_real_project_when_explicitly_supplied() {
     let Some(path) = std::env::var_os("SAMDEBUG_REAL_CPROJ").map(PathBuf::from) else {
         return;
