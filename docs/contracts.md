@@ -50,11 +50,18 @@ Initial operations are `session.start`, `session.stop`, `target.halt`,
 `breakpoint.insert`, `breakpoint.remove`, `stack.list`, `variables.list`,
 `registers.read`, `memory.read`, and `firmware.load`.
 
-Unknown fields are allowed for forward compatibility. Unknown operations or
-unsupported protocol major versions are rejected. Input lines have a 1 MiB
+Unknown protocol fields are rejected in v1; compatibility is provided by an
+explicit schema-version change rather than by silently accepting ambiguous
+input. Unknown operations or unsupported protocol versions are rejected. Input lines have a 1 MiB
 limit. Malformed input produces a typed response when an id can be recovered;
 otherwise it produces a protocol error event and the session remains alive
 unless framing can no longer be trusted.
+
+Operation payloads and results are normative in
+`schemas/debug-v1.schema.json`. Agent `session.start` requires the exact probe
+serial. The ELF is the artifact selected by `samdebug.toml`; v1 does not accept
+an arbitrary ELF path over the agent protocol. Memory reads are limited to
+65,536 bytes per request.
 
 ## Authorization
 

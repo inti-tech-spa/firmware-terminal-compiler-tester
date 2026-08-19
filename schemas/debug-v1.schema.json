@@ -10,7 +10,7 @@
     { "$ref": "#/$defs/event" }
   ],
   "$defs": {
-    "id": { "type": ["string", "integer"] },
+    "id": { "oneOf": [{ "type": "string" }, { "type": "integer" }] },
     "operation": {
       "enum": [
         "session.start", "session.stop", "target.halt", "target.continue",
@@ -40,19 +40,20 @@
       },
       "additionalProperties": false,
       "allOf": [
-        {
-          "if": { "properties": { "operation": { "const": "firmware.load" } }, "required": ["operation"] },
-          "then": {
-            "properties": {
-              "payload": {
-                "type": "object",
-                "required": ["authorization"],
-                "properties": { "authorization": { "$ref": "#/$defs/authorization" } },
-                "additionalProperties": true
-              }
-            }
-          }
-        }
+        { "if": { "$ref": "#/$defs/isSessionStart" }, "then": { "properties": { "payload": { "$ref": "#/$defs/sessionStartPayload" } } } },
+        { "if": { "$ref": "#/$defs/isSessionStop" }, "then": { "properties": { "payload": { "$ref": "#/$defs/emptyPayload" } } } },
+        { "if": { "$ref": "#/$defs/isTargetHalt" }, "then": { "properties": { "payload": { "$ref": "#/$defs/emptyPayload" } } } },
+        { "if": { "$ref": "#/$defs/isTargetContinue" }, "then": { "properties": { "payload": { "$ref": "#/$defs/emptyPayload" } } } },
+        { "if": { "$ref": "#/$defs/isTargetReset" }, "then": { "properties": { "payload": { "$ref": "#/$defs/resetPayload" } } } },
+        { "if": { "$ref": "#/$defs/isTargetStep" }, "then": { "properties": { "payload": { "$ref": "#/$defs/emptyPayload" } } } },
+        { "if": { "$ref": "#/$defs/isTargetNext" }, "then": { "properties": { "payload": { "$ref": "#/$defs/emptyPayload" } } } },
+        { "if": { "$ref": "#/$defs/isBreakpointInsert" }, "then": { "properties": { "payload": { "$ref": "#/$defs/breakpointInsertPayload" } } } },
+        { "if": { "$ref": "#/$defs/isBreakpointRemove" }, "then": { "properties": { "payload": { "$ref": "#/$defs/breakpointRemovePayload" } } } },
+        { "if": { "$ref": "#/$defs/isStackList" }, "then": { "properties": { "payload": { "$ref": "#/$defs/stackListPayload" } } } },
+        { "if": { "$ref": "#/$defs/isVariablesList" }, "then": { "properties": { "payload": { "$ref": "#/$defs/variablesListPayload" } } } },
+        { "if": { "$ref": "#/$defs/isRegistersRead" }, "then": { "properties": { "payload": { "$ref": "#/$defs/registersReadPayload" } } } },
+        { "if": { "$ref": "#/$defs/isMemoryRead" }, "then": { "properties": { "payload": { "$ref": "#/$defs/memoryReadPayload" } } } },
+        { "if": { "$ref": "#/$defs/isFirmwareLoad" }, "then": { "properties": { "payload": { "$ref": "#/$defs/firmwareLoadPayload" } } } }
       ]
     },
     "responseBase": {
@@ -78,7 +79,21 @@
             "ok": { "const": true }, "result": {}
           },
           "additionalProperties": false
-        }
+        },
+        { "if": { "$ref": "#/$defs/isSessionStart" }, "then": { "properties": { "result": { "$ref": "#/$defs/sessionStartResult" } } } },
+        { "if": { "$ref": "#/$defs/isSessionStop" }, "then": { "properties": { "result": { "$ref": "#/$defs/idleResult" } } } },
+        { "if": { "$ref": "#/$defs/isTargetHalt" }, "then": { "properties": { "result": { "$ref": "#/$defs/haltedResult" } } } },
+        { "if": { "$ref": "#/$defs/isTargetContinue" }, "then": { "properties": { "result": { "$ref": "#/$defs/runningResult" } } } },
+        { "if": { "$ref": "#/$defs/isTargetReset" }, "then": { "properties": { "result": { "$ref": "#/$defs/haltedResult" } } } },
+        { "if": { "$ref": "#/$defs/isTargetStep" }, "then": { "properties": { "result": { "$ref": "#/$defs/haltedResult" } } } },
+        { "if": { "$ref": "#/$defs/isTargetNext" }, "then": { "properties": { "result": { "$ref": "#/$defs/haltedResult" } } } },
+        { "if": { "$ref": "#/$defs/isBreakpointInsert" }, "then": { "properties": { "result": { "$ref": "#/$defs/breakpointResult" } } } },
+        { "if": { "$ref": "#/$defs/isBreakpointRemove" }, "then": { "properties": { "result": { "$ref": "#/$defs/breakpointRemoveResult" } } } },
+        { "if": { "$ref": "#/$defs/isStackList" }, "then": { "properties": { "result": { "$ref": "#/$defs/stackResult" } } } },
+        { "if": { "$ref": "#/$defs/isVariablesList" }, "then": { "properties": { "result": { "$ref": "#/$defs/variablesResult" } } } },
+        { "if": { "$ref": "#/$defs/isRegistersRead" }, "then": { "properties": { "result": { "$ref": "#/$defs/registersResult" } } } },
+        { "if": { "$ref": "#/$defs/isMemoryRead" }, "then": { "properties": { "result": { "$ref": "#/$defs/memoryResult" } } } },
+        { "if": { "$ref": "#/$defs/isFirmwareLoad" }, "then": { "properties": { "result": { "$ref": "#/$defs/loadResult" } } } }
       ]
     },
     "responseFailure": {
@@ -123,6 +138,104 @@
       },
       "additionalProperties": false
     },
+    "emptyPayload": { "type": "object", "additionalProperties": false },
+    "sessionStartPayload": {
+      "type": "object", "required": ["probe_serial"],
+      "properties": { "probe_serial": { "type": "string", "minLength": 1 } },
+      "additionalProperties": false
+    },
+    "resetPayload": {
+      "type": "object", "properties": { "halt": { "const": true } },
+      "additionalProperties": false
+    },
+    "breakpointInsertPayload": {
+      "type": "object", "required": ["location"],
+      "properties": { "location": { "type": "string", "minLength": 1 }, "temporary": { "type": "boolean", "default": false } },
+      "additionalProperties": false
+    },
+    "breakpointRemovePayload": {
+      "type": "object", "required": ["breakpoint_id"],
+      "properties": { "breakpoint_id": { "type": "string", "minLength": 1 } },
+      "additionalProperties": false
+    },
+    "stackListPayload": {
+      "type": "object",
+      "properties": { "start": { "type": "integer", "minimum": 0, "default": 0 }, "levels": { "type": "integer", "minimum": 1, "maximum": 256, "default": 32 } },
+      "additionalProperties": false
+    },
+    "variablesListPayload": {
+      "type": "object", "properties": { "frame": { "type": "integer", "minimum": 0, "default": 0 } },
+      "additionalProperties": false
+    },
+    "registersReadPayload": {
+      "type": "object", "required": ["names"],
+      "properties": { "names": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } } },
+      "additionalProperties": false
+    },
+    "memoryReadPayload": {
+      "type": "object", "required": ["address", "length"],
+      "properties": { "address": { "type": "integer", "minimum": 0 }, "length": { "type": "integer", "minimum": 1, "maximum": 65536 } },
+      "additionalProperties": false
+    },
+    "firmwareLoadPayload": {
+      "type": "object", "required": ["authorization"],
+      "properties": { "authorization": { "$ref": "#/$defs/authorization" } },
+      "additionalProperties": false
+    },
+    "sessionStartResult": {
+      "type": "object", "required": ["generation", "state", "probe_serial"],
+      "properties": { "generation": { "type": "integer", "minimum": 1 }, "state": { "const": "halted" }, "probe_serial": { "type": "string", "minLength": 1 } },
+      "additionalProperties": false
+    },
+    "idleResult": { "type": "object", "required": ["state"], "properties": { "state": { "const": "idle" } }, "additionalProperties": false },
+    "haltedResult": {
+      "type": "object", "required": ["state"],
+      "properties": { "state": { "const": "halted" }, "stop_reason": { "type": "string" }, "frame": { "$ref": "#/$defs/frame" } },
+      "additionalProperties": false
+    },
+    "runningResult": { "type": "object", "required": ["state"], "properties": { "state": { "const": "running" } }, "additionalProperties": false },
+    "breakpointResult": {
+      "type": "object", "required": ["breakpoint_id", "location", "enabled", "temporary"],
+      "properties": { "breakpoint_id": { "type": "string" }, "location": { "type": "string" }, "enabled": { "type": "boolean" }, "temporary": { "type": "boolean" } },
+      "additionalProperties": false
+    },
+    "breakpointRemoveResult": { "type": "object", "required": ["removed_id"], "properties": { "removed_id": { "type": "string" } }, "additionalProperties": false },
+    "frame": {
+      "type": "object", "required": ["index", "function"],
+      "properties": { "index": { "type": "integer", "minimum": 0 }, "function": { "type": "string" }, "file": { "type": "string" }, "line": { "type": "integer", "minimum": 1 }, "address": { "type": "integer", "minimum": 0 } },
+      "additionalProperties": false
+    },
+    "stackResult": { "type": "object", "required": ["frames"], "properties": { "frames": { "type": "array", "items": { "$ref": "#/$defs/frame" } } }, "additionalProperties": false },
+    "variablesResult": {
+      "type": "object", "required": ["variables"],
+      "properties": { "variables": { "type": "array", "items": { "type": "object", "required": ["name", "value"], "properties": { "name": { "type": "string" }, "value": { "type": "string" }, "type": { "type": "string" } }, "additionalProperties": false } } },
+      "additionalProperties": false
+    },
+    "registersResult": {
+      "type": "object", "required": ["registers"],
+      "properties": { "registers": { "type": "array", "items": { "type": "object", "required": ["name", "value"], "properties": { "name": { "type": "string" }, "value": { "type": "string" } }, "additionalProperties": false } } },
+      "additionalProperties": false
+    },
+    "memoryResult": {
+      "type": "object", "required": ["address", "length", "bytes_hex"],
+      "properties": { "address": { "type": "integer", "minimum": 0 }, "length": { "type": "integer", "minimum": 1, "maximum": 65536 }, "bytes_hex": { "type": "string", "pattern": "^([0-9A-Fa-f]{2})+$" } },
+      "additionalProperties": false
+    },
+    "loadResult": { "type": "object", "required": ["state", "verified"], "properties": { "state": { "const": "halted" }, "verified": { "const": true } }, "additionalProperties": false },
+    "isSessionStart": { "type": "object", "properties": { "operation": { "const": "session.start" } }, "required": ["operation"] },
+    "isSessionStop": { "type": "object", "properties": { "operation": { "const": "session.stop" } }, "required": ["operation"] },
+    "isTargetHalt": { "type": "object", "properties": { "operation": { "const": "target.halt" } }, "required": ["operation"] },
+    "isTargetContinue": { "type": "object", "properties": { "operation": { "const": "target.continue" } }, "required": ["operation"] },
+    "isTargetReset": { "type": "object", "properties": { "operation": { "const": "target.reset" } }, "required": ["operation"] },
+    "isTargetStep": { "type": "object", "properties": { "operation": { "const": "target.step" } }, "required": ["operation"] },
+    "isTargetNext": { "type": "object", "properties": { "operation": { "const": "target.next" } }, "required": ["operation"] },
+    "isBreakpointInsert": { "type": "object", "properties": { "operation": { "const": "breakpoint.insert" } }, "required": ["operation"] },
+    "isBreakpointRemove": { "type": "object", "properties": { "operation": { "const": "breakpoint.remove" } }, "required": ["operation"] },
+    "isStackList": { "type": "object", "properties": { "operation": { "const": "stack.list" } }, "required": ["operation"] },
+    "isVariablesList": { "type": "object", "properties": { "operation": { "const": "variables.list" } }, "required": ["operation"] },
+    "isRegistersRead": { "type": "object", "properties": { "operation": { "const": "registers.read" } }, "required": ["operation"] },
+    "isMemoryRead": { "type": "object", "properties": { "operation": { "const": "memory.read" } }, "required": ["operation"] },
+    "isFirmwareLoad": { "type": "object", "properties": { "operation": { "const": "firmware.load" } }, "required": ["operation"] },
     "error": {
       "type": "object", "required": ["code", "message"],
       "properties": {

@@ -57,6 +57,7 @@ records from earlier generations.
 | `halted` | reset-halt | `halted` | reset and stopped events |
 | `running` | reset-halt | `halted` | reset and stopped events |
 | `halted` | authorized firmware load | `halted` | progress and loaded events |
+| `halted` | breakpoint insert/remove | `halted` | breakpoint result; no state event |
 | any live state | `session.stop` | `disconnecting`, then `idle` | stopped event |
 | `failed` | automatic cleanup | `disconnecting`, then `idle` | session error, then stopped event |
 | any non-idle state | cancellation | `cancelling`, then `disconnecting`, then `idle` | cancelled event |
@@ -64,7 +65,9 @@ records from earlier generations.
 `session.start` is accepted only in `idle`. Continue is accepted only in
 `halted`; halt only in `running`; step, next, firmware load, stack, variables,
 register, and memory inspection only in `halted`. Session stop and cancellation
-are idempotent. Reset-halt is valid in `halted` or `running`. All other
+are idempotent. Public operation `target.reset` always means reset-halt and is
+valid in `halted` or `running`. Breakpoint insertion and removal are accepted
+only in `halted`. All other
 command/state pairs fail with `INVALID_SESSION_STATE` and do not change state.
 
 OpenOCD/GDB exit, target power loss, or probe removal moves any live state to
