@@ -10,10 +10,15 @@ pub struct Diagnostic {
     pub location: Option<String>,
 }
 
-/// Finite command envelope. Exactly one of `data` and `error` is serialized.
+/// Finite command envelope. Its private representation prevents contradictory
+/// `ok`, schema-version, data, and error combinations.
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+pub struct FiniteResult<T: Serialize>(FiniteResultKind<T>);
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
-pub enum FiniteResult<T: Serialize> {
+enum FiniteResultKind<T: Serialize> {
     Success {
         schema_version: u32,
         ok: bool,
@@ -33,24 +38,24 @@ pub enum FiniteResult<T: Serialize> {
 impl<T: Serialize> FiniteResult<T> {
     #[must_use]
     pub fn success(command: impl Into<String>, data: T) -> Self {
-        Self::Success {
+        Self(FiniteResultKind::Success {
             schema_version: SCHEMA_VERSION,
             ok: true,
             command: command.into(),
             data,
             warnings: Vec::new(),
-        }
+        })
     }
 
     #[must_use]
     pub fn failure(command: impl Into<String>, error: SamdebugError) -> Self {
-        Self::Failure {
+        Self(FiniteResultKind::Failure {
             schema_version: SCHEMA_VERSION,
             ok: false,
             command: command.into(),
             error,
             warnings: Vec::new(),
-        }
+        })
     }
 }
 

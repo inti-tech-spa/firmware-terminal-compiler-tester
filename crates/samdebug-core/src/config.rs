@@ -170,7 +170,7 @@ transport = "swd"
         )]));
         let error =
             SamdebugConfig::load(&fs, Path::new("samdebug.toml")).expect_err("reject device");
-        assert_eq!(error.code, "UNSUPPORTED_PROJECT");
+        assert_eq!(error.code(), "UNSUPPORTED_PROJECT");
     }
 
     #[test]

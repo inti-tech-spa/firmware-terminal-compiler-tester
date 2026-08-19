@@ -291,6 +291,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "samdebug-core",
+ "samdebug-tools",
  "samdebug-tui",
  "serde",
  "serde_json",

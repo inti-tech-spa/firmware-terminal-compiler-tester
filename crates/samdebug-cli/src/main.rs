@@ -1,7 +1,11 @@
-use std::{path::PathBuf, process::ExitCode};
+use std::{ffi::OsString, path::PathBuf, process::ExitCode, time::Duration};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
-use samdebug_core::{CancellationToken, ErrorCategory, FiniteResult, SamdebugError};
+use samdebug_core::{
+    CancellationToken, ErrorCategory, FiniteResult, SamdebugError,
+    ports::{CommandSpec, ProcessRunner},
+};
+use samdebug_tools::{ChildSupervisor, SystemProcessRunner};
 use serde::Serialize;
 use serde_json::json;
 
@@ -43,6 +47,8 @@ enum Command {
     Erase(AuthorizedArgs),
     Flash(AuthorizedArgs),
     Debug(DebugArgs),
+    #[command(name = "__test-block", hide = true)]
+    InternalTestBlock,
 }
 
 #[derive(Debug, Args)]
@@ -99,7 +105,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err((command, error)) => {
-            let code = error.exit_code;
+            let code = error.exit_code();
             emit_failure(cli.output, command, error);
             ExitCode::from(u8::try_from(code).unwrap_or(1))
         }
@@ -107,7 +113,9 @@ fn main() -> ExitCode {
 }
 
 fn parse_cli() -> Result<Cli, ExitCode> {
-    match Cli::try_parse() {
+    let args: Vec<OsString> = std::env::args_os().collect();
+    let output = requested_output(&args);
+    match Cli::try_parse_from(&args) {
         Ok(cli) => Ok(cli),
         Err(error)
             if matches!(
@@ -115,15 +123,27 @@ fn parse_cli() -> Result<Cli, ExitCode> {
                 ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
             ) =>
         {
-            print!("{error}");
+            if matches!(output, OutputFormat::Json) {
+                if error.kind() == ErrorKind::DisplayVersion {
+                    emit_success(
+                        output,
+                        "version",
+                        serde_json::to_value(VersionData {
+                            version: env!("CARGO_PKG_VERSION"),
+                            target: std::env::consts::ARCH,
+                        })
+                        .expect("version serializes"),
+                    );
+                } else {
+                    emit_success(output, "help", json!({"text": error.to_string()}));
+                }
+            } else {
+                print!("{error}");
+            }
             Err(ExitCode::SUCCESS)
         }
         Err(error) => {
-            let json_requested = std::env::args()
-                .collect::<Vec<_>>()
-                .windows(2)
-                .any(|pair| pair == ["--output", "json"]);
-            if json_requested {
+            if matches!(output, OutputFormat::Json) {
                 emit_failure(
                     OutputFormat::Json,
                     "cli",
@@ -140,6 +160,20 @@ fn parse_cli() -> Result<Cli, ExitCode> {
             }
             Err(ExitCode::from(2))
         }
+    }
+}
+
+fn requested_output(args: &[OsString]) -> OutputFormat {
+    let json_pair = args.windows(2).any(|pair| {
+        pair[0] == std::ffi::OsStr::new("--output") && pair[1] == std::ffi::OsStr::new("json")
+    });
+    let json_equals = args
+        .iter()
+        .any(|arg| arg == std::ffi::OsStr::new("--output=json"));
+    if json_pair || json_equals {
+        OutputFormat::Json
+    } else {
+        OutputFormat::Human
     }
 }
 
@@ -171,6 +205,9 @@ fn dispatch(
             .map_err(|error| ("debug", error)),
         Command::Erase(args) => authorized_reserved_command("erase", args),
         Command::Flash(args) => authorized_reserved_command("flash", args),
+        Command::InternalTestBlock => run_internal_blocking_test(cancellation)
+            .map(|code| ("__test-block", json!({"child_exit_code": code})))
+            .map_err(|error| ("__test-block", error)),
         command => Err((
             command_name(command),
             SamdebugError::new(
@@ -219,7 +256,32 @@ fn command_name(command: &Command) -> &'static str {
         Command::Erase(_) => "erase",
         Command::Flash(_) => "flash",
         Command::Debug(_) => "debug",
+        Command::InternalTestBlock => "__test-block",
     }
+}
+
+fn run_internal_blocking_test(cancellation: &CancellationToken) -> Result<i32, SamdebugError> {
+    let runner = SystemProcessRunner;
+    let child = runner.spawn(&CommandSpec {
+        program: "/bin/sleep".to_owned(),
+        args: vec!["30".to_owned()],
+        current_dir: None,
+    })?;
+    let mut supervisor = ChildSupervisor::new(child, Duration::from_secs(1));
+    if let Ok(path) = std::env::var("SAMDEBUG_TEST_CHILD_PID_FILE") {
+        std::fs::write(
+            path,
+            supervisor.id().expect("supervisor owns child").to_string(),
+        )
+        .map_err(|error| {
+            SamdebugError::new(
+                ErrorCategory::Tool,
+                "TEST_PID_FILE_FAILED",
+                error.to_string(),
+            )
+        })?;
+    }
+    supervisor.wait_until_exit(cancellation, Duration::from_millis(10))
 }
 
 fn validate_authorization(operation: &str, args: &AuthorizedArgs) -> Result<(), SamdebugError> {

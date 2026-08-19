@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Serialize, Serializer, ser::SerializeStruct};
 use thiserror::Error;
 
 pub type SamdebugResult<T> = Result<T, SamdebugError>;
@@ -33,16 +33,13 @@ impl ErrorCategory {
     }
 }
 
-#[derive(Debug, Clone, Error, Serialize)]
+#[derive(Debug, Clone, Error)]
 #[error("{message}")]
 pub struct SamdebugError {
-    pub code: String,
-    pub message: String,
-    pub exit_code: i32,
-    #[serde(skip)]
-    pub category: ErrorCategory,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<serde_json::Value>,
+    code: String,
+    message: String,
+    category: ErrorCategory,
+    details: Option<serde_json::Value>,
 }
 
 impl SamdebugError {
@@ -55,7 +52,6 @@ impl SamdebugError {
         Self {
             code: code.into(),
             message: message.into(),
-            exit_code: category.exit_code(),
             category,
             details: None,
         }
@@ -65,6 +61,38 @@ impl SamdebugError {
     pub fn with_details(mut self, details: serde_json::Value) -> Self {
         self.details = Some(details);
         self
+    }
+
+    #[must_use]
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    #[must_use]
+    pub const fn category(&self) -> ErrorCategory {
+        self.category
+    }
+
+    #[must_use]
+    pub const fn exit_code(&self) -> i32 {
+        self.category.exit_code()
+    }
+}
+
+impl Serialize for SamdebugError {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let field_count = if self.details.is_some() { 4 } else { 3 };
+        let mut state = serializer.serialize_struct("SamdebugError", field_count)?;
+        state.serialize_field("code", &self.code)?;
+        state.serialize_field("message", &self.message)?;
+        state.serialize_field("exit_code", &self.exit_code())?;
+        if let Some(details) = &self.details {
+            state.serialize_field("details", details)?;
+        }
+        state.end()
     }
 }
 
