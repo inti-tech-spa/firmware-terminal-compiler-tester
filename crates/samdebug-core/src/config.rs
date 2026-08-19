@@ -21,6 +21,17 @@ pub struct ProjectConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ToolConfig {
     pub channel: String,
+    pub system: Option<SystemToolConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SystemToolConfig {
+    pub gcc: String,
+    pub gdb: String,
+    pub openocd: String,
+    pub objcopy: String,
+    pub objdump: String,
+    pub size: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -89,7 +100,16 @@ impl SamdebugConfig {
                 "v1 requires a Microchip Studio ATSAM4SD32C project",
             ));
         }
-        if self.tools.channel != "pinned"
+        let tools_valid = match self.tools.channel.as_str() {
+            "pinned" => self.tools.system.is_none(),
+            "system" => self
+                .tools
+                .system
+                .as_ref()
+                .is_some_and(SystemToolConfig::paths_are_absolute),
+            _ => false,
+        };
+        if !tools_valid
             || self.probe.kind != "atmel-ice"
             || self.probe.transport != "swd"
             || self.probe.speed_khz == 0
@@ -101,6 +121,21 @@ impl SamdebugConfig {
             ));
         }
         Ok(())
+    }
+}
+
+impl SystemToolConfig {
+    fn paths_are_absolute(&self) -> bool {
+        [
+            &self.gcc,
+            &self.gdb,
+            &self.openocd,
+            &self.objcopy,
+            &self.objdump,
+            &self.size,
+        ]
+        .into_iter()
+        .all(|path| Path::new(path).is_absolute())
     }
 }
 
@@ -196,5 +231,42 @@ transport = "swd"
         let loaded = SamdebugConfig::load(&fs, Path::new("samdebug.toml")).expect("valid config");
         assert_eq!(loaded.warnings.len(), 1);
         assert_eq!(loaded.warnings[0].code, "UNKNOWN_CONFIG_KEY");
+    }
+
+    #[test]
+    fn system_tools_require_an_explicit_complete_absolute_path_set() {
+        let valid = r#"
+schema_version = 1
+[project]
+kind = "microchip-studio-cproj"
+path = "firmware.cproj"
+configuration = "Debug"
+device = "ATSAM4SD32C"
+[tools]
+channel = "system"
+[tools.system]
+gcc = "/opt/tools/arm-none-eabi-gcc"
+gdb = "/opt/tools/arm-none-eabi-gdb"
+openocd = "/opt/tools/openocd"
+objcopy = "/opt/tools/arm-none-eabi-objcopy"
+objdump = "/opt/tools/arm-none-eabi-objdump"
+size = "/opt/tools/arm-none-eabi-size"
+[probe]
+kind = "atmel-ice"
+transport = "swd"
+"#;
+        let fs = FakeFs(HashMap::from([(
+            PathBuf::from("samdebug.toml"),
+            valid.into(),
+        )]));
+        let loaded = SamdebugConfig::load(&fs, Path::new("samdebug.toml"))
+            .expect("explicit system tools are valid");
+        assert_eq!(loaded.config.tools.channel, "system");
+
+        let relative = valid.replace("/opt/tools/arm-none-eabi-gcc", "bin/arm-none-eabi-gcc");
+        let fs = FakeFs(HashMap::from([(PathBuf::from("samdebug.toml"), relative)]));
+        let error = SamdebugConfig::load(&fs, Path::new("samdebug.toml"))
+            .expect_err("relative system tool must be rejected");
+        assert_eq!(error.code(), "INVALID_CONFIG");
     }
 }

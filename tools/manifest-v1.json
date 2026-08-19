@@ -2,7 +2,8 @@
   "schema_version": 1,
   "channel": "pinned",
   "installable": false,
-  "reason": "M2 must publish audited binary records with exact checksums before enabling installation.",
+  "reason": "The Arm record and reproducible OpenOCD candidate are complete, but the OpenOCD binary and source archives have not yet been published at their pinned release URLs. Installation remains fail-closed.",
+  "required_tools": ["arm-gnu-toolchain", "openocd"],
   "pins": {
     "arm_gnu_toolchain": {
       "version": "15.2.Rel1",
@@ -19,5 +20,91 @@
       "source": "https://github.com/openocd-org/openocd/releases/tag/v0.12.0"
     }
   },
-  "artifacts": []
+  "artifacts": [
+    {
+      "name": "arm-gnu-toolchain",
+      "version": "15.2.Rel1",
+      "os": "macos",
+      "architecture": "aarch64",
+      "url": "https://armkeil.blob.core.windows.net/developer/files/downloads/gnu/15.2.rel1/binrel/arm-gnu-toolchain-15.2.rel1-darwin-arm64-arm-none-eabi.tar.xz",
+      "allowed_hosts": ["armkeil.blob.core.windows.net"],
+      "sha256": "1938a84b7105c192e3fb4fa5e893ba25f425f7ddab40515ae608cd40f68669a8",
+      "archive": {
+        "kind": "tar.xz",
+        "root": "arm-gnu-toolchain-15.2.rel1-darwin-arm64-arm-none-eabi"
+      },
+      "executables": [
+        {
+          "name": "arm-none-eabi-gcc",
+          "path": "bin/arm-none-eabi-gcc",
+          "version_args": ["--version"],
+          "version_contains": "Arm GNU Toolchain 15.2.Rel1"
+        },
+        {
+          "name": "arm-none-eabi-gdb",
+          "path": "bin/arm-none-eabi-gdb",
+          "version_args": ["--version"],
+          "version_contains": "Arm GNU Toolchain 15.2.Rel1"
+        },
+        {
+          "name": "arm-none-eabi-objcopy",
+          "path": "bin/arm-none-eabi-objcopy",
+          "version_args": ["--version"],
+          "version_contains": "Arm GNU Toolchain 15.2.Rel1"
+        },
+        {
+          "name": "arm-none-eabi-objdump",
+          "path": "bin/arm-none-eabi-objdump",
+          "version_args": ["--version"],
+          "version_contains": "Arm GNU Toolchain 15.2.Rel1"
+        },
+        {
+          "name": "arm-none-eabi-size",
+          "path": "bin/arm-none-eabi-size",
+          "version_args": ["--version"],
+          "version_contains": "Arm GNU Toolchain 15.2.Rel1"
+        }
+      ],
+      "licenses": [
+        {"spdx": "GPL-3.0-or-later", "path": "share/doc/gcc/Copying.html"},
+        {"spdx": "GPL-3.0-or-later", "path": "share/doc/gdb/Copying.html"},
+        {"spdx": "LicenseRef-Arm-GNU-Release-Notices", "path": "share/doc/arm-none-eabi/readme.txt"},
+        {"spdx": "LicenseRef-Arm-GNU-Manifest", "path": "15.2.rel1-darwin-arm64-arm-none-eabi-manifest.txt"}
+      ],
+      "source_url": "https://armkeil.blob.core.windows.net/developer/files/downloads/gnu/15.2.rel1/srcrel/arm-gnu-toolchain-src-snapshot-15.2.rel1.tar.xz",
+      "source_sha256": "06f4e5792b566a771c300ac6f46c3422e23e34f4e3a5d44a8cb5594ead6fb82e",
+      "source_offer": "accompanying-source"
+    },
+    {
+      "name": "openocd",
+      "version": "0.12.0",
+      "os": "macos",
+      "architecture": "aarch64",
+      "url": "https://github.com/inti-tech-spa/firmware-terminal-compiler-tester/releases/download/tools-v1/samdebug-openocd-0.12.0-darwin-arm64.tar.xz",
+      "allowed_hosts": ["github.com", "release-assets.githubusercontent.com"],
+      "sha256": "60e9601b76f6afb8e8dc00f7eb6b36b2901730cf6ae0a047b14fbe9be3fab011",
+      "archive": {
+        "kind": "tar.xz",
+        "root": "samdebug-openocd-0.12.0-darwin-arm64"
+      },
+      "executables": [
+        {
+          "name": "openocd",
+          "path": "bin/openocd",
+          "version_args": ["--version"],
+          "version_contains": "Open On-Chip Debugger 0.12.0"
+        }
+      ],
+      "licenses": [
+        {"spdx": "GPL-2.0-or-later", "path": "licenses/OpenOCD-COPYING"},
+        {"spdx": "LGPL-2.1-or-later", "path": "licenses/libusb-COPYING"},
+        {"spdx": "BSD-3-Clause OR GPL-3.0-only", "path": "licenses/hidapi-LICENSE.txt"},
+        {"spdx": "BSD-2-Clause", "path": "licenses/JimTcl-LICENSE"},
+        {"spdx": "LicenseRef-JimTcl-Tcl", "path": "licenses/JimTcl-tcl.license.terms"}
+      ],
+      "source_url": "https://github.com/inti-tech-spa/firmware-terminal-compiler-tester/releases/download/tools-v1/samdebug-openocd-0.12.0-sources.tar.xz",
+      "source_sha256": "c1d4bf9546e0ad2249b5785c707edf0d67b972186d624fd024ba27751cca88b2",
+      "source_offer": "accompanying-source"
+    }
+  ]
 }

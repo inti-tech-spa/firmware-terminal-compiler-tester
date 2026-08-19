@@ -13,8 +13,10 @@ files, upstream source URL, and source-offer obligations. A record with missing
 or placeholder integrity/licensing data is invalid and cannot install.
 
 Downloads go to a new temporary file. The SHA-256 is verified before parsing.
-Extraction rejects absolute paths, `..`, device entries, hard links, and
-symlinks that can escape the staging root. The staged tree is validated and
+Extraction rejects absolute paths, `..`, device entries, and all symbolic
+links. Archive hard links are never created: an internal, validated regular-file
+target is materialized as an independent copy, while external, missing, chained,
+or otherwise unsafe targets are rejected. The staged tree is validated and
 atomically renamed into a versioned destination. Interrupted staging trees are
 removed on the next run. Offline mode only accepts a completely verified cache.
 
@@ -26,17 +28,19 @@ removed on the next run. Offline mode only accepts a completely verified cache.
   workflow for `darwin-arm64` with CMSIS-DAP HID support and the upstream Tcl
   scripts intact.
 
-The project-built OpenOCD binary is not installable until its release artifact,
-exact checksum, build recipe, SBOM, notices, and corresponding-source archive
-are published and added to the manifest. The same rule applies to the exact Arm
-artifact checksum. M1 requires no redistributed binaries; M2 cannot be approved
-until these records are complete.
+The project-built OpenOCD candidate includes its exact checksum, deterministic
+build recipe, SPDX SBOM, notices, and a separate corresponding-source archive.
+Two consecutive local builds produced identical binary and source archive
+hashes. The embedded record remains non-installable until both archives are
+published at their pinned release URLs and downloaded back for verification.
 
 ## Licensing decisions
 
 `samdebug` is licensed under MIT and communicates with GCC, GDB, and
-OpenOCD as separate executables. No
-GPL code is linked into the Rust process. Redistribution will nevertheless ship
+OpenOCD as separate executables. No GPL code is linked into the Rust process.
+OpenOCD statically includes its upstream JimTcl 0.80 snapshot and dynamically
+loads the bundled libusb 1.0.29 and HIDAPI 0.15.0 libraries; each is represented
+in the SBOM and its license text is included. Redistribution will nevertheless ship
 the complete applicable GPL notices and license texts. For every redistributed
 GPL binary, the same release and download location will provide the exact
 corresponding-source archive and build scripts at no additional charge. The

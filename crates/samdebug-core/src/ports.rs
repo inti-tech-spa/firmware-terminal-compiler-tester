@@ -8,8 +8,18 @@ pub trait FileSystem: std::fmt::Debug + Send + Sync {
     fn read_to_string(&self, path: &Path) -> SamdebugResult<String>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadReceipt {
+    pub final_url: String,
+}
+
 pub trait Downloader: std::fmt::Debug + Send + Sync {
-    fn download(&self, url: &str, destination: &Path) -> SamdebugResult<()>;
+    fn download(
+        &self,
+        url: &str,
+        allowed_hosts: &[String],
+        destination: &Path,
+    ) -> SamdebugResult<DownloadReceipt>;
 }
 
 pub trait Clock: std::fmt::Debug + Send + Sync {

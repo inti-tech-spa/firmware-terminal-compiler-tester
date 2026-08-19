@@ -5,7 +5,10 @@ use samdebug_core::{
     CancellationToken, ErrorCategory, FiniteResult, SamdebugError,
     ports::{CommandSpec, ProcessRunner},
 };
-use samdebug_tools::{ChildSupervisor, SystemProcessRunner};
+use samdebug_tools::{
+    ChildSupervisor, CurlDownloader, Installer, MacUsbProbeProvider, Platform, SystemProcessRunner,
+    ToolManifest, run_doctor,
+};
 use serde::Serialize;
 use serde_json::json;
 
@@ -200,6 +203,22 @@ fn dispatch(
             })
             .expect("version serializes"),
         )),
+        Command::Setup { offline } => setup_command(*offline)
+            .map(|report| {
+                (
+                    "setup",
+                    serde_json::to_value(report).expect("setup report serializes"),
+                )
+            })
+            .map_err(|error| ("setup", error)),
+        Command::Doctor => doctor_command()
+            .map(|report| {
+                (
+                    "doctor",
+                    serde_json::to_value(report).expect("doctor report serializes"),
+                )
+            })
+            .map_err(|error| ("doctor", error)),
         Command::Debug(args) if !args.agent => samdebug_tui::run()
             .map(|()| ("debug", json!({})))
             .map_err(|error| ("debug", error)),
@@ -216,6 +235,49 @@ fn dispatch(
                 "command is reserved for a later audited milestone",
             ),
         )),
+    }
+}
+
+fn setup_command(offline: bool) -> Result<samdebug_tools::InstallReport, SamdebugError> {
+    let manifest = embedded_manifest()?;
+    Installer::new(managed_root()?, Platform::current(), &CurlDownloader)
+        .install(&manifest, offline)
+}
+
+fn doctor_command() -> Result<samdebug_tools::DoctorReport, SamdebugError> {
+    let manifest = embedded_manifest()?;
+    run_doctor(
+        &manifest,
+        &managed_root()?,
+        &Platform::current(),
+        &MacUsbProbeProvider,
+        &SystemProcessRunner,
+    )
+}
+
+fn embedded_manifest() -> Result<ToolManifest, SamdebugError> {
+    serde_json::from_str(include_str!("../../../tools/manifest-v1.json")).map_err(|error| {
+        SamdebugError::new(
+            ErrorCategory::Tool,
+            "INVALID_TOOL_MANIFEST",
+            error.to_string(),
+        )
+    })
+}
+
+fn managed_root() -> Result<PathBuf, SamdebugError> {
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        SamdebugError::new(
+            ErrorCategory::Tool,
+            "USER_DATA_DIRECTORY_UNAVAILABLE",
+            "HOME is unavailable; cannot resolve the user-local tool directory",
+        )
+    })?;
+    let home = PathBuf::from(home);
+    if std::env::consts::OS == "macos" {
+        Ok(home.join("Library/Application Support/samdebug"))
+    } else {
+        Ok(home.join(".local/share/samdebug"))
     }
 }
 

@@ -8,7 +8,8 @@ pub mod ports;
 
 pub use cancellation::CancellationToken;
 pub use config::{
-    Configuration, LoadedConfig, ProbeConfig, ProjectConfig, SamdebugConfig, ToolConfig,
+    Configuration, LoadedConfig, ProbeConfig, ProjectConfig, SamdebugConfig, SystemToolConfig,
+    ToolConfig,
 };
 pub use error::{ErrorCategory, SamdebugError, SamdebugResult};
 pub use output::{Diagnostic, FiniteResult};

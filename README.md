@@ -15,6 +15,8 @@ report is committed under `docs/audits/`.
 
 ## Status
 
-Architecture and public contracts are defined in `docs/`. Implementation begins
-only after the M0 audit is approved.
-
+M0 (architecture/contracts) and M1 (Rust core/CLI foundation) are independently
+approved. M2's secure installer, doctor, production Arm toolchain record, and
+OpenOCD bundle build workflow are under development. The production manifest
+remains fail-closed until the audited OpenOCD release asset is published; see
+`docs/setup.md`.

@@ -1,5 +1,5 @@
 /target/
+/dist/
 /.samdebug/
 *.log
 .DS_Store
-

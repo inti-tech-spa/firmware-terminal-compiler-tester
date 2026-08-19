@@ -65,17 +65,29 @@ fn json_equals_form_wraps_errors_help_and_version() {
 }
 
 #[test]
-fn reserved_command_has_stable_json_error_and_exit_code() {
+fn doctor_has_stable_json_report() {
     let output = Command::new(env!("CARGO_BIN_EXE_samdebug"))
         .args(["doctor", "--output", "json"])
         .output()
         .expect("run samdebug");
-    assert_eq!(output.status.code(), Some(2));
+    assert!(output.status.success());
     assert!(output.stderr.is_empty());
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
-    assert_eq!(value["ok"], false);
-    assert_eq!(value["error"]["code"], "NOT_IMPLEMENTED");
-    assert_eq!(value["error"]["exit_code"], 2);
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["command"], "doctor");
+    assert!(value["data"]["tools"].is_array());
+}
+
+#[test]
+fn setup_fails_closed_while_openocd_bundle_is_unpublished() {
+    let output = Command::new(env!("CARGO_BIN_EXE_samdebug"))
+        .args(["setup", "--output=json"])
+        .output()
+        .expect("run setup");
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
+    assert_eq!(value["error"]["code"], "TOOL_MANIFEST_DISABLED");
 }
 
 #[test]

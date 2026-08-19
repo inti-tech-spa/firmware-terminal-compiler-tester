@@ -1,5 +1,14 @@
 //! Managed tool and process adapters.
 
+mod doctor;
+mod installer;
+
+pub use doctor::{DoctorReport, MacUsbProbeProvider, ProbeHealth, ToolHealth, run_doctor};
+pub use installer::{
+    ArchiveSpec, CurlDownloader, ExecutableSpec, InstallReport, Installer, LicenseSpec, Platform,
+    ToolArtifact, ToolManifest,
+};
+
 use std::{
     process::{Command, Stdio},
     thread,
