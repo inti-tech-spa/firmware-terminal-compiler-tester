@@ -1653,4 +1653,21 @@ mod tests {
             .expect("install project OpenOCD bundle");
         assert_eq!(report.installed, ["openocd@0.12.0"]);
     }
+
+    #[test]
+    fn production_manifest_is_enabled_and_complete_for_macos_arm64() {
+        let manifest: ToolManifest =
+            serde_json::from_str(include_str!("../../../tools/manifest-v1.json"))
+                .expect("production manifest parses");
+        assert!(manifest.installable);
+        assert_eq!(manifest.required_tools, ["arm-gnu-toolchain", "openocd"]);
+        assert_eq!(
+            manifest
+                .artifacts
+                .iter()
+                .filter(|artifact| artifact.os == "macos" && artifact.architecture == "aarch64")
+                .count(),
+            2
+        );
+    }
 }

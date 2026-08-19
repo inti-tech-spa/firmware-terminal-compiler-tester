@@ -560,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn doctor_reports_disabled_manifest_missing_tool_and_absent_probe() {
+    fn doctor_reports_enabled_manifest_missing_tool_and_absent_probe() {
         let temp = TempDir::new().expect("tempdir");
         let manifest: ToolManifest =
             serde_json::from_str(include_str!("../../../tools/manifest-v1.json"))
@@ -576,7 +576,7 @@ mod tests {
             &FakeRunner,
         )
         .expect("doctor report");
-        assert!(!report.manifest_installable);
+        assert!(report.manifest_installable);
         assert_eq!(report.tools[0].install, "missing");
         assert_eq!(report.tools[0].cache, "missing");
         assert_eq!(report.probe.status, "absent");

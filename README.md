@@ -17,6 +17,5 @@ report is committed under `docs/audits/`.
 
 M0 (architecture/contracts) and M1 (Rust core/CLI foundation) are independently
 approved. M2's secure installer, doctor, production Arm toolchain record, and
-OpenOCD bundle build workflow are under development. The production manifest
-remains fail-closed until the audited OpenOCD release asset is published; see
-`docs/setup.md`.
+reproducible OpenOCD release are implemented and awaiting final independent
+approval; see `docs/setup.md`.

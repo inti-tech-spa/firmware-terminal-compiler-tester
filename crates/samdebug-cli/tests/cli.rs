@@ -158,18 +158,6 @@ transport = "swd"
 }
 
 #[test]
-fn setup_fails_closed_while_openocd_bundle_is_unpublished() {
-    let output = Command::new(env!("CARGO_BIN_EXE_samdebug"))
-        .args(["setup", "--output=json"])
-        .output()
-        .expect("run setup");
-    assert_eq!(output.status.code(), Some(3));
-    assert!(output.stderr.is_empty());
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
-    assert_eq!(value["error"]["code"], "TOOL_MANIFEST_DISABLED");
-}
-
-#[test]
 fn authorization_is_probe_and_operation_scoped() {
     let rejected = Command::new(env!("CARGO_BIN_EXE_samdebug"))
         .args([

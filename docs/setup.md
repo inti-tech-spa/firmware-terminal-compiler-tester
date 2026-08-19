@@ -32,11 +32,9 @@ objcopy, objdump, and size. Doctor loads that configuration, runs every tool's
 version check, and warns that the override is not reproducible. The generated
 default remains `channel = "pinned"`.
 
-## Current publication gate
+## Published tool channel
 
-The verified Arm GNU Toolchain 15.2.Rel1 record and the reproducible OpenOCD
-0.12.0 macOS-arm64 candidate are complete. The embedded manifest remains
-deliberately non-installable until the OpenOCD binary and corresponding-source
-archives are published at, and downloaded back from, their pinned release URLs.
-Until then `samdebug setup` returns `TOOL_MANIFEST_DISABLED`; it never downloads
-a partial tool set.
+The verified Arm GNU Toolchain 15.2.Rel1 and reproducible OpenOCD 0.12.0
+macOS-arm64 archives are published at the pinned URLs in the manifest. Both
+release archives were downloaded anonymously after publication and matched
+their checked-in SHA-256 values. The production manifest is installable.

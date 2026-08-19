@@ -1,8 +1,7 @@
 {
   "schema_version": 1,
   "channel": "pinned",
-  "installable": false,
-  "reason": "The Arm record and reproducible OpenOCD candidate are complete, but the OpenOCD binary and source archives have not yet been published at their pinned release URLs. Installation remains fail-closed.",
+  "installable": true,
   "required_tools": ["arm-gnu-toolchain", "openocd"],
   "pins": {
     "arm_gnu_toolchain": {

@@ -31,8 +31,9 @@ removed on the next run. Offline mode only accepts a completely verified cache.
 The project-built OpenOCD candidate includes its exact checksum, deterministic
 build recipe, SPDX SBOM, notices, and a separate corresponding-source archive.
 Two consecutive local builds produced identical binary and source archive
-hashes. The embedded record remains non-installable until both archives are
-published at their pinned release URLs and downloaded back for verification.
+hashes. Both archives are published at their pinned release URLs; anonymous
+download-back verification matched the manifest hashes before the production
+manifest was enabled.
 
 ## Licensing decisions
 
@@ -40,7 +41,7 @@ published at their pinned release URLs and downloaded back for verification.
 OpenOCD as separate executables. No GPL code is linked into the Rust process.
 OpenOCD statically includes its upstream JimTcl 0.80 snapshot and dynamically
 loads the bundled libusb 1.0.29 and HIDAPI 0.15.0 libraries; each is represented
-in the SBOM and its license text is included. Redistribution will nevertheless ship
+in the SBOM and its license text is included. Redistribution nevertheless ships
 the complete applicable GPL notices and license texts. For every redistributed
 GPL binary, the same release and download location will provide the exact
 corresponding-source archive and build scripts at no additional charge. The
