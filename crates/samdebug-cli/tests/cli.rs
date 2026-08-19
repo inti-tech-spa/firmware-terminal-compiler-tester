@@ -1,4 +1,5 @@
 use std::{
+    path::Path,
     process::{Command, Stdio},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -293,4 +294,119 @@ fn sigint_cancels_setup_and_removes_partial_download() {
     assert!(partials.is_empty(), "partial download was not removed");
     let _ = std::fs::remove_dir_all(root);
     let _ = std::fs::remove_file(ready_file);
+}
+
+#[test]
+#[cfg(unix)]
+fn sigint_cancels_active_build_tool_cleans_stage_and_returns_130() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().expect("tempdir");
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../samdebug-project/tests/fixtures");
+    copy_tree(&fixtures, temp.path());
+    let project = temp.path().join("valid");
+    let tools = temp.path().join("tools");
+    std::fs::create_dir(&tools).expect("tools directory");
+    let pid_file = temp.path().join("build-child.pid");
+    for name in ["gcc", "gdb", "openocd", "objcopy", "objdump", "size"] {
+        let path = tools.join(name);
+        let body = if name == "gcc" {
+            "#!/bin/sh\necho $$ > \"$SAMDEBUG_TEST_BUILD_CHILD_PID_FILE\"\nexec /bin/sleep 30\n"
+        } else {
+            "#!/bin/sh\nexit 0\n"
+        };
+        std::fs::write(&path, body).expect("write tool");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make tool executable");
+    }
+    let tool = |name: &str| tools.join(name).to_string_lossy().into_owned();
+    let config = format!(
+        r#"schema_version = 1
+[project]
+kind = "microchip-studio-cproj"
+path = "project.cproj"
+configuration = "Debug"
+device = "ATSAM4SD32C"
+[tools]
+channel = "system"
+[tools.system]
+gcc = {gcc:?}
+gdb = {gdb:?}
+openocd = {openocd:?}
+objcopy = {objcopy:?}
+objdump = {objdump:?}
+size = {size:?}
+[probe]
+kind = "atmel-ice"
+transport = "swd"
+"#,
+        gcc = tool("gcc"),
+        gdb = tool("gdb"),
+        openocd = tool("openocd"),
+        objcopy = tool("objcopy"),
+        objdump = tool("objdump"),
+        size = tool("size"),
+    );
+    std::fs::write(project.join("samdebug.toml"), config).expect("write config");
+
+    let process = Command::new(env!("CARGO_BIN_EXE_samdebug"))
+        .args(["build", "--output=json"])
+        .current_dir(&project)
+        .env("SAMDEBUG_TEST_BUILD_CHILD_PID_FILE", &pid_file)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn build");
+    let tool_pid = (0..300)
+        .find_map(|_| {
+            let pid = std::fs::read_to_string(&pid_file).ok();
+            if pid.is_none() {
+                thread::sleep(Duration::from_millis(10));
+            }
+            pid
+        })
+        .expect("build tool started");
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-INT", &process.id().to_string()])
+            .status()
+            .expect("signal samdebug")
+            .success()
+    );
+    let output = process.wait_with_output().expect("wait for build");
+    assert_eq!(output.status.code(), Some(130));
+    assert!(output.stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert_eq!(value["error"]["code"], "INTERRUPTED");
+    assert!(
+        !Command::new("/bin/kill")
+            .args(["-0", tool_pid.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .expect("probe build tool")
+            .success(),
+        "build tool survived cancellation"
+    );
+    let build_dir = project.join(".samdebug/build/Debug");
+    let stale_stage = std::fs::read_dir(build_dir)
+        .expect("build directory")
+        .filter_map(Result::ok)
+        .any(|entry| entry.file_name().to_string_lossy().starts_with(".stage-"));
+    assert!(
+        !stale_stage,
+        "private staging directory survived cancellation"
+    );
+}
+
+fn copy_tree(source: &Path, destination: &Path) {
+    std::fs::create_dir_all(destination).expect("create fixture destination");
+    for entry in std::fs::read_dir(source).expect("read fixture tree") {
+        let entry = entry.expect("fixture entry");
+        let target = destination.join(entry.file_name());
+        if entry.file_type().expect("fixture type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).expect("copy fixture file");
+        }
+    }
 }

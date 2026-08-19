@@ -12,6 +12,7 @@ pub use installer::{
 };
 
 use std::{
+    io::Read,
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -165,6 +166,110 @@ impl ProcessRunner for SystemProcessRunner {
             .map_err(|error| process_error("PROCESS_SPAWN_FAILED", &error))?;
         Ok(Box::new(SystemChild { child }))
     }
+
+    fn run_cancellable(
+        &self,
+        command: &CommandSpec,
+        cancellation: &CancellationToken,
+    ) -> SamdebugResult<CommandOutput> {
+        if cancellation.is_cancelled() {
+            return Err(SamdebugError::new(
+                ErrorCategory::Interrupted,
+                "INTERRUPTED",
+                "operation interrupted",
+            ));
+        }
+        let mut process = make_command(command);
+        process
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_finite_process(&mut process);
+        let mut child = process
+            .spawn()
+            .map_err(|error| process_error("PROCESS_RUN_FAILED", &error))?;
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let stdout_reader = thread::spawn(move || read_pipe(stdout));
+        let stderr_reader = thread::spawn(move || read_pipe(stderr));
+        let status = loop {
+            if cancellation.is_cancelled() {
+                kill_finite_process(&mut child);
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(SamdebugError::new(
+                    ErrorCategory::Interrupted,
+                    "INTERRUPTED",
+                    "operation interrupted",
+                ));
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => thread::sleep(Duration::from_millis(10)),
+                Err(error) => {
+                    kill_finite_process(&mut child);
+                    let _ = child.wait();
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    return Err(process_error("PROCESS_WAIT_FAILED", &error));
+                }
+            }
+        };
+        let stdout = stdout_reader.join().map_err(|_| {
+            SamdebugError::new(
+                ErrorCategory::Tool,
+                "PROCESS_OUTPUT_FAILED",
+                "stdout reader panicked",
+            )
+        })??;
+        let stderr = stderr_reader.join().map_err(|_| {
+            SamdebugError::new(
+                ErrorCategory::Tool,
+                "PROCESS_OUTPUT_FAILED",
+                "stderr reader panicked",
+            )
+        })??;
+        Ok(CommandOutput {
+            exit_code: status.code(),
+            stdout,
+            stderr,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn configure_finite_process(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_finite_process(_command: &mut Command) {}
+
+fn kill_finite_process(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let group = format!("-{}", child.id());
+        let killed = Command::new("/bin/kill")
+            .args(["-KILL", &group])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if killed {
+            return;
+        }
+    }
+    let _ = child.kill();
+}
+
+fn read_pipe(mut pipe: impl Read) -> SamdebugResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    pipe.read_to_end(&mut bytes)
+        .map_err(|error| process_error("PROCESS_OUTPUT_FAILED", &error))?;
+    Ok(bytes)
 }
 
 fn make_command(spec: &CommandSpec) -> Command {
@@ -234,8 +339,11 @@ mod tests {
         time::Duration,
     };
 
-    use super::ChildSupervisor;
-    use samdebug_core::{ErrorCategory, SamdebugError, SamdebugResult, ports::ManagedChild};
+    use super::{ChildSupervisor, SystemProcessRunner};
+    use samdebug_core::{
+        CancellationToken, ErrorCategory, SamdebugError, SamdebugResult,
+        ports::{CommandSpec, ManagedChild, ProcessRunner},
+    };
 
     #[derive(Debug, Default)]
     struct Calls {
@@ -395,5 +503,87 @@ mod tests {
         let (mut supervisor, _calls) = supervisor(failures, false);
         assert!(supervisor.shutdown().is_err());
         assert_eq!(supervisor.id(), Some(42));
+    }
+
+    #[test]
+    fn finite_process_is_killed_and_reaped_on_cancellation() {
+        let cancellation = CancellationToken::new();
+        let signal = cancellation.clone();
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            signal.cancel();
+        });
+        let started = std::time::Instant::now();
+        let error = SystemProcessRunner
+            .run_cancellable(
+                &CommandSpec {
+                    program: "/bin/sleep".into(),
+                    args: vec!["30".into()],
+                    current_dir: None,
+                },
+                &cancellation,
+            )
+            .expect_err("cancellation stops process");
+        thread.join().expect("signal thread");
+        assert_eq!(error.code(), "INTERRUPTED");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn finite_process_cancellation_kills_descendant_process_group() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let script = temp.path().join("process-tree.sh");
+        let pid_file = temp.path().join("descendant.pid");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n/bin/sleep 30 &\necho $! > \"$1\"\nwait\n",
+        )
+        .expect("write process-tree script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("make script executable");
+
+        let cancellation = CancellationToken::new();
+        let signal = cancellation.clone();
+        let ready = pid_file.clone();
+        let thread = std::thread::spawn(move || {
+            for _ in 0..200 {
+                if ready.is_file() {
+                    signal.cancel();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            signal.cancel();
+        });
+        let error = SystemProcessRunner
+            .run_cancellable(
+                &CommandSpec {
+                    program: script.to_string_lossy().into_owned(),
+                    args: vec![pid_file.to_string_lossy().into_owned()],
+                    current_dir: None,
+                },
+                &cancellation,
+            )
+            .expect_err("cancellation stops process tree");
+        thread.join().expect("signal thread");
+        assert_eq!(error.code(), "INTERRUPTED");
+        let descendant = std::fs::read_to_string(pid_file).expect("descendant pid");
+        let gone = (0..200).any(|_| {
+            let status = std::process::Command::new("/bin/kill")
+                .args(["-0", descendant.trim()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("probe descendant");
+            if status.success() {
+                std::thread::sleep(Duration::from_millis(10));
+                false
+            } else {
+                true
+            }
+        });
+        assert!(gone, "descendant process survived cancellation");
     }
 }

@@ -61,5 +61,19 @@ pub trait ManagedChild: std::fmt::Debug + Send {
 
 pub trait ProcessRunner: std::fmt::Debug + Send + Sync {
     fn run(&self, command: &CommandSpec) -> SamdebugResult<CommandOutput>;
+    fn run_cancellable(
+        &self,
+        command: &CommandSpec,
+        cancellation: &CancellationToken,
+    ) -> SamdebugResult<CommandOutput> {
+        if cancellation.is_cancelled() {
+            return Err(crate::SamdebugError::new(
+                crate::ErrorCategory::Interrupted,
+                "INTERRUPTED",
+                "operation interrupted",
+            ));
+        }
+        self.run(command)
+    }
     fn spawn(&self, command: &CommandSpec) -> SamdebugResult<Box<dyn ManagedChild>>;
 }

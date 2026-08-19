@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeSet,
+    fmt::Write as _,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -10,6 +11,7 @@ use samdebug_core::{
     CancellationToken, Configuration, ErrorCategory, SamdebugError, SamdebugResult,
     ports::{CommandOutput, CommandSpec, ProcessRunner},
 };
+use sha2::{Digest, Sha256};
 
 use crate::{
     ArtifactInfo, ArtifactsReport, BuildReport, BuildToolPaths, CleanReport, MemoryUsage,
@@ -35,10 +37,13 @@ pub fn build(
     validate_tools(tools)?;
     let imported = import_cproj(project_file, configuration)?;
     let plan = &imported.plan;
+    validate_imported_flags(plan)?;
+    let compiler_identity = tool_identity(Path::new(&tools.gcc))?;
     let root = project_file.parent().unwrap_or_else(|| Path::new("."));
     let state = ensure_state(root)?;
     let build_dir = state.join("build").join(&plan.configuration);
     ensure_output_directory(&state, &build_dir)?;
+    let staging = StageDirectory::create(&build_dir)?;
     write_plan(&state.join("import-plan.json"), plan)?;
 
     let object_dir = build_dir.join("obj");
@@ -55,19 +60,12 @@ pub fn build(
         let object = object_dir.join(format!("{index:04}-{basename}.o"));
         let dependency = object.with_extension("d");
         let stamp = object.with_extension("command.json");
+        let staged_object = staging.path.join(object.file_name().expect("object name"));
+        let staged_dependency = staged_object.with_extension("d");
         for output in [&object, &dependency, &stamp] {
             ensure_file_target(&state, output)?;
         }
-        let mut args = TARGET_FLAGS
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        args.extend([
-            "-mlong-calls".into(),
-            "-D__SAM4SD32C__".into(),
-            "-Wno-error=incompatible-pointer-types".into(),
-        ]);
-        args.extend(plan.compiler_flags.iter().cloned());
+        let mut args = plan.compiler_flags.clone();
         if source.kind != SourceKind::C {
             args.extend(plan.assembler_flags.iter().cloned());
             args.push(
@@ -105,17 +103,36 @@ pub fn build(
             args.push("-I".into());
             args.push(include);
         }
+        args.extend(TARGET_FLAGS.iter().map(ToString::to_string));
+        args.extend([
+            "-mlong-calls".into(),
+            "-D__SAM4SD32C__".into(),
+            "-Wno-error=incompatible-pointer-types".into(),
+        ]);
         args.extend([
             "-MMD".into(),
             "-MP".into(),
             "-MF".into(),
-            dependency.to_string_lossy().into_owned(),
+            staged_dependency.to_string_lossy().into_owned(),
             "-c".into(),
-            source.path.clone(),
+            root.join(&source.path).to_string_lossy().into_owned(),
             "-o".into(),
-            object.to_string_lossy().into_owned(),
+            staged_object.to_string_lossy().into_owned(),
         ]);
-        let command_bytes = serde_json::to_vec(&args).expect("argv serializes");
+        let fingerprint_args: Vec<_> = args
+            .iter()
+            .map(|argument| {
+                if argument == &staged_object.to_string_lossy() {
+                    object.to_string_lossy().into_owned()
+                } else if argument == &staged_dependency.to_string_lossy() {
+                    dependency.to_string_lossy().into_owned()
+                } else {
+                    argument.clone()
+                }
+            })
+            .collect();
+        let command_bytes = serde_json::to_vec(&(&compiler_identity, &fingerprint_args))
+            .expect("tool identity and argv serialize");
         if is_current(
             root,
             &source.path,
@@ -126,7 +143,18 @@ pub fn build(
         )? {
             reused += 1;
         } else {
-            run_checked(runner, &tools.gcc, args, root, "COMPILE_FAILED")?;
+            run_checked(
+                runner,
+                &tools.gcc,
+                args,
+                root,
+                cancellation,
+                "COMPILE_FAILED",
+            )?;
+            validate_staged_output(&staging.path, &staged_object)?;
+            validate_staged_output(&staging.path, &staged_dependency)?;
+            promote_output(&staging.path, &staged_object, &state, &object)?;
+            promote_output(&staging.path, &staged_dependency, &state, &dependency)?;
             write_replace(&stamp, &command_bytes)?;
             compiled += 1;
         }
@@ -136,12 +164,11 @@ pub fn build(
     check_cancelled(cancellation)?;
     let elf = build_dir.join(format!("{}{}", plan.output_name, plan.output_extension));
     let map = build_dir.join(format!("{}.map", plan.output_name));
+    let staged_elf = staging.path.join(elf.file_name().expect("ELF name"));
+    let staged_map = staging.path.join(map.file_name().expect("map name"));
     ensure_file_target(&state, &elf)?;
     ensure_file_target(&state, &map)?;
-    let mut link_args = TARGET_FLAGS
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
+    let mut link_args = Vec::new();
     link_args.extend(
         objects
             .iter()
@@ -151,7 +178,7 @@ pub fn build(
     if let Some(script) = &plan.linker_script {
         link_args.push(format!("-T{script}"));
     }
-    link_args.push(format!("-Wl,-Map,{}", map.to_string_lossy()));
+    link_args.push(format!("-Wl,-Map,{}", staged_map.to_string_lossy()));
     for directory in &plan.library_search_paths {
         link_args.push(format!("-L{directory}"));
     }
@@ -163,14 +190,25 @@ pub fn build(
         ));
     }
     link_args.push("-Wl,--end-group".into());
-    link_args.extend(["-o".into(), elf.to_string_lossy().into_owned()]);
-    run_checked(runner, &tools.gcc, link_args, root, "LINK_FAILED")?;
+    link_args.extend(TARGET_FLAGS.iter().map(ToString::to_string));
+    link_args.extend(["-o".into(), staged_elf.to_string_lossy().into_owned()]);
+    run_checked(
+        runner,
+        &tools.gcc,
+        link_args,
+        root,
+        cancellation,
+        "LINK_FAILED",
+    )?;
+    validate_staged_output(&staging.path, &staged_elf)?;
+    validate_staged_output(&staging.path, &staged_map)?;
 
     let size_output = run_checked(
         runner,
         &tools.size,
-        vec![elf.to_string_lossy().into_owned()],
+        vec![staged_elf.to_string_lossy().into_owned()],
         root,
+        cancellation,
         "SIZE_INSPECTION_FAILED",
     )?;
     let memory = parse_size(&size_output.stdout)?;
@@ -187,11 +225,16 @@ pub fn build(
     let header = run_checked(
         runner,
         &tools.objdump,
-        vec!["-f".into(), elf.to_string_lossy().into_owned()],
+        vec![
+            "-f".into(),
+            "-p".into(),
+            staged_elf.to_string_lossy().into_owned(),
+        ],
         root,
+        cancellation,
         "ELF_INSPECTION_FAILED",
     )?;
-    let entry_point = parse_entry(&header.stdout)?;
+    let entry_point = validate_elf(&header.stdout)?;
     if !(FLASH_START..FLASH_END).contains(&entry_point) {
         return Err(SamdebugError::new(
             ErrorCategory::Project,
@@ -199,6 +242,9 @@ pub fn build(
             format!("ELF entry point 0x{entry_point:08x} is outside ATSAM4SD32C flash"),
         ));
     }
+    check_cancelled(cancellation)?;
+    promote_output(&staging.path, &staged_elf, &state, &elf)?;
+    promote_output(&staging.path, &staged_map, &state, &map)?;
 
     let size_path = build_dir.join(format!("{}.size", plan.output_name));
     ensure_file_target(&state, &size_path)?;
@@ -207,10 +253,12 @@ pub fn build(
     generate_artifacts(
         root,
         &state,
+        &staging.path,
         &build_dir,
         plan,
         tools,
         runner,
+        cancellation,
         &elf,
         &mut generated,
     )?;
@@ -258,9 +306,20 @@ pub fn artifacts(
             fs::read_dir(&path).map_err(|error| build_io("ARTIFACT_READ_FAILED", &error))?
         {
             let entry = entry.map_err(|error| build_io("ARTIFACT_READ_FAILED", &error))?;
-            let metadata = entry
-                .metadata()
+            let metadata = fs::symlink_metadata(entry.path())
                 .map_err(|error| build_io("ARTIFACT_READ_FAILED", &error))?;
+            if metadata.file_type().is_symlink()
+                || (metadata.is_file() && has_multiple_links(&metadata))
+            {
+                return Err(SamdebugError::new(
+                    ErrorCategory::Project,
+                    "UNSAFE_ARTIFACT_PATH",
+                    format!(
+                        "artifact is not a private regular file: {}",
+                        entry.path().display()
+                    ),
+                ));
+            }
             if metadata.is_file() {
                 found.push(ArtifactInfo {
                     path: entry.path().display().to_string(),
@@ -280,10 +339,12 @@ pub fn artifacts(
 fn generate_artifacts(
     root: &Path,
     state: &Path,
+    staging: &Path,
     build_dir: &Path,
     plan: &crate::BuildPlan,
     tools: &BuildToolPaths,
     runner: &dyn ProcessRunner,
+    cancellation: &CancellationToken,
     elf: &Path,
     generated: &mut Vec<PathBuf>,
 ) -> SamdebugResult<()> {
@@ -294,6 +355,7 @@ fn generate_artifacts(
     ] {
         if enabled {
             let output = build_dir.join(format!("{}.{}", plan.output_name, extension));
+            let staged = staging.join(output.file_name().expect("artifact name"));
             ensure_file_target(state, &output)?;
             run_checked(
                 runner,
@@ -302,11 +364,13 @@ fn generate_artifacts(
                     "-O".into(),
                     format.into(),
                     elf.to_string_lossy().into_owned(),
-                    output.to_string_lossy().into_owned(),
+                    staged.to_string_lossy().into_owned(),
                 ],
                 root,
+                cancellation,
                 "ARTIFACT_GENERATION_FAILED",
             )?;
+            promote_output(staging, &staged, state, &output)?;
             generated.push(output);
         }
     }
@@ -318,13 +382,22 @@ fn generate_artifacts(
             &tools.objdump,
             vec!["-h".into(), "-S".into(), elf.to_string_lossy().into_owned()],
             root,
+            cancellation,
             "DISASSEMBLY_FAILED",
         )?;
+        if result.stdout.is_empty() {
+            return Err(SamdebugError::new(
+                ErrorCategory::Project,
+                "EXPECTED_OUTPUT_INVALID",
+                "objdump produced an empty disassembly",
+            ));
+        }
         write_replace(&output, &result.stdout)?;
         generated.push(output);
     }
     if plan.artifacts.eeprom {
         let output = build_dir.join(format!("{}.eep", plan.output_name));
+        let staged = staging.join(output.file_name().expect("EEPROM artifact name"));
         ensure_file_target(state, &output)?;
         run_checked(
             runner,
@@ -339,11 +412,13 @@ fn generate_artifacts(
                 "-O".into(),
                 "ihex".into(),
                 elf.to_string_lossy().into_owned(),
-                output.to_string_lossy().into_owned(),
+                staged.to_string_lossy().into_owned(),
             ],
             root,
+            cancellation,
             "ARTIFACT_GENERATION_FAILED",
         )?;
+        promote_output(staging, &staged, state, &output)?;
         generated.push(output);
     }
     Ok(())
@@ -354,13 +429,17 @@ fn run_checked(
     program: &str,
     args: Vec<String>,
     current_dir: &Path,
+    cancellation: &CancellationToken,
     code: &str,
 ) -> SamdebugResult<CommandOutput> {
-    let output = runner.run(&CommandSpec {
-        program: program.into(),
-        args,
-        current_dir: Some(current_dir.to_owned()),
-    })?;
+    let output = runner.run_cancellable(
+        &CommandSpec {
+            program: program.into(),
+            args,
+            current_dir: Some(current_dir.to_owned()),
+        },
+        cancellation,
+    )?;
     if output.exit_code == Some(0) {
         Ok(output)
     } else {
@@ -385,6 +464,177 @@ fn validate_tools(tools: &BuildToolPaths) -> SamdebugResult<()> {
         }
     }
     Ok(())
+}
+
+fn validate_imported_flags(plan: &crate::BuildPlan) -> SamdebugResult<()> {
+    let mut allow_param_value = false;
+    for flag in &plan.compiler_flags {
+        let allowed = if allow_param_value {
+            allow_param_value = false;
+            flag.strip_prefix("max-inline-insns-single=")
+                .is_some_and(|value| {
+                    !value.is_empty() && value.chars().all(|character| character.is_ascii_digit())
+                })
+        } else if flag == "--param" {
+            allow_param_value = true;
+            true
+        } else {
+            flag == "-pipe"
+                || matches!(
+                    flag.as_str(),
+                    "-fdata-sections" | "-ffunction-sections" | "-fno-strict-aliasing"
+                )
+                || flag.starts_with("-D")
+                || matches!(flag.as_str(), "-O0" | "-O1" | "-O2" | "-O3" | "-Os" | "-Og")
+                || matches!(flag.as_str(), "-g" | "-g1" | "-g2" | "-g3")
+                || matches!(
+                    flag.as_str(),
+                    "-std=gnu99" | "-std=c99" | "-std=gnu11" | "-std=c11"
+                )
+                || (flag.starts_with("-W")
+                    && !flag.starts_with("-Wa,")
+                    && !flag.starts_with("-Wl,")
+                    && !flag.starts_with("-Wp,"))
+        };
+        if !allowed || flag.starts_with('@') {
+            return unsafe_flag("compiler", flag);
+        }
+    }
+    if allow_param_value {
+        return unsafe_flag("compiler", "--param without an approved value");
+    }
+    for flag in &plan.assembler_flags {
+        if !(flag.starts_with("-D")
+            || matches!(flag.as_str(), "-g" | "-g1" | "-g2" | "-g3" | "-Wa,-g"))
+        {
+            return unsafe_flag("assembler", flag);
+        }
+    }
+    for flag in &plan.linker_flags {
+        let allowed = matches!(
+            flag.as_str(),
+            "-mthumb" | "-Wl,--cref" | "-Wl,--gc-sections"
+        ) || flag.strip_prefix("-Wl,--entry=").is_some_and(|entry| {
+            !entry.is_empty()
+                && entry
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        });
+        if !allowed {
+            return unsafe_flag("linker", flag);
+        }
+    }
+    Ok(())
+}
+
+fn unsafe_flag<T>(kind: &str, flag: &str) -> SamdebugResult<T> {
+    Err(SamdebugError::new(
+        ErrorCategory::Project,
+        "UNSAFE_IMPORTED_FLAG",
+        format!("unsupported imported {kind} flag: {flag}"),
+    ))
+}
+
+fn tool_identity(path: &Path) -> SamdebugResult<String> {
+    let bytes = fs::read(path).map_err(|error| build_io("TOOL_IDENTITY_FAILED", &error))?;
+    let mut digest = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        write!(&mut digest, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    Ok(format!("{}:{digest}", path.display()))
+}
+
+#[derive(Debug)]
+struct StageDirectory {
+    path: PathBuf,
+}
+
+impl StageDirectory {
+    fn create(build_dir: &Path) -> SamdebugResult<Self> {
+        let path = build_dir.join(format!(
+            ".stage-{}-{}",
+            std::process::id(),
+            OUTPUT_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).map_err(|error| build_io("STAGE_CREATE_FAILED", &error))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(error) = fs::set_permissions(&path, fs::Permissions::from_mode(0o700)) {
+                let _ = fs::remove_dir(&path);
+                return Err(build_io("STAGE_PERMISSION_FAILED", &error));
+            }
+        }
+        Ok(Self { path })
+    }
+}
+
+impl Drop for StageDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn promote_output(
+    staging: &Path,
+    source: &Path,
+    state: &Path,
+    destination: &Path,
+) -> SamdebugResult<()> {
+    ensure_file_target(state, destination)?;
+    validate_staged_output(staging, source)?;
+    fs::rename(source, destination).map_err(|error| build_io("OUTPUT_PROMOTION_FAILED", &error))
+}
+
+fn validate_staged_output(staging: &Path, source: &Path) -> SamdebugResult<()> {
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|error| build_io("EXPECTED_OUTPUT_MISSING", &error))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || has_multiple_links(&metadata)
+    {
+        return Err(SamdebugError::new(
+            ErrorCategory::Project,
+            "EXPECTED_OUTPUT_INVALID",
+            format!(
+                "tool output is not a private non-empty regular file: {}",
+                source.display()
+            ),
+        ));
+    }
+    let parent = source.parent().ok_or_else(|| {
+        SamdebugError::new(
+            ErrorCategory::Project,
+            "EXPECTED_OUTPUT_INVALID",
+            "tool output has no parent",
+        )
+    })?;
+    if parent
+        .canonicalize()
+        .map_err(|error| build_io("EXPECTED_OUTPUT_INVALID", &error))?
+        != staging
+            .canonicalize()
+            .map_err(|error| build_io("EXPECTED_OUTPUT_INVALID", &error))?
+    {
+        return Err(SamdebugError::new(
+            ErrorCategory::Project,
+            "EXPECTED_OUTPUT_ESCAPE",
+            "tool output escaped its private staging directory",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn has_multiple_links(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink() != 1
+}
+
+#[cfg(not(unix))]
+const fn has_multiple_links(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 fn ensure_state(root: &Path) -> SamdebugResult<PathBuf> {
@@ -478,12 +728,14 @@ fn ensure_file_target(state: &Path, path: &Path) -> SamdebugResult<()> {
         ));
     }
     if let Ok(metadata) = fs::symlink_metadata(path)
-        && metadata.file_type().is_symlink()
+        && (metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || has_multiple_links(&metadata))
     {
         return Err(SamdebugError::new(
             ErrorCategory::Project,
             "UNSAFE_OUTPUT_PATH",
-            format!("output is a symlink: {}", path.display()),
+            format!("output is not a private regular file: {}", path.display()),
         ));
     }
     Ok(())
@@ -530,12 +782,14 @@ fn write_plan(path: &Path, plan: &crate::BuildPlan) -> SamdebugResult<()> {
 
 fn write_replace(path: &Path, bytes: &[u8]) -> SamdebugResult<()> {
     if let Ok(metadata) = fs::symlink_metadata(path)
-        && metadata.file_type().is_symlink()
+        && (metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || has_multiple_links(&metadata))
     {
         return Err(SamdebugError::new(
             ErrorCategory::Project,
             "UNSAFE_OUTPUT_PATH",
-            format!("output is a symlink: {}", path.display()),
+            format!("output is not a private regular file: {}", path.display()),
         ));
     }
     let temporary = path.with_extension(format!(
@@ -668,8 +922,22 @@ fn parse_size(bytes: &[u8]) -> SamdebugResult<MemoryUsage> {
     })
 }
 
-fn parse_entry(bytes: &[u8]) -> SamdebugResult<u64> {
+fn validate_elf(bytes: &[u8]) -> SamdebugResult<u64> {
     let text = String::from_utf8_lossy(bytes);
+    for required in [
+        "file format elf32-littlearm",
+        "architecture: armv7e-m",
+        "[Version5 EABI]",
+        "[soft-float ABI]",
+    ] {
+        if !text.contains(required) {
+            return Err(SamdebugError::new(
+                ErrorCategory::Project,
+                "INVALID_ELF_TARGET",
+                format!("ELF does not report required target property: {required}"),
+            ));
+        }
+    }
     let raw = text
         .lines()
         .find_map(|line| line.trim().strip_prefix("start address "))

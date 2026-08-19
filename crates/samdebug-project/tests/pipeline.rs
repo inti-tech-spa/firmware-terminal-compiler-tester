@@ -16,6 +16,7 @@ struct FakeRunner {
     calls: Mutex<Vec<CommandSpec>>,
     compile_failure: bool,
     link_failure: bool,
+    create_outputs: bool,
     size: &'static str,
     entry: &'static str,
 }
@@ -26,8 +27,9 @@ impl FakeRunner {
             calls: Mutex::new(Vec::new()),
             compile_failure: false,
             link_failure: false,
+            create_outputs: true,
             size: "text data bss dec hex filename\n1000 20 30 1050 41a firmware.elf\n",
-            entry: "start address 0x00400101\n",
+            entry: "file format elf32-littlearm\narchitecture: armv7e-m\nstart address 0x00400101\nprivate flags = 0x5000200: [Version5 EABI] [soft-float ABI]\n",
         }
     }
 }
@@ -42,6 +44,9 @@ impl ProcessRunner for FakeRunner {
         if name == "gcc" && command.args.contains(&"-c".into()) {
             if self.compile_failure {
                 return Ok(output(1, b"controlled compile failure"));
+            }
+            if !self.create_outputs {
+                return Ok(output(0, b""));
             }
             let object = argument_after(&command.args, "-o");
             let dependency = argument_after(&command.args, "-MF");
@@ -283,7 +288,7 @@ fn reports_controlled_compile_memory_and_entry_failures() {
     );
 
     let bad_entry = FakeRunner {
-        entry: "start address 0x00000000\n",
+        entry: "file format elf32-littlearm\narchitecture: armv7e-m\nstart address 0x00000000\nprivate flags = 0x5000200: [Version5 EABI] [soft-float ABI]\n",
         ..FakeRunner::successful()
     };
     assert_eq!(
@@ -322,4 +327,146 @@ fn rejects_symlinked_build_ancestor_before_external_write() {
     assert_eq!(error.code(), "UNSAFE_BUILD_DIRECTORY");
     assert!(!external.path().join("Debug").exists());
     assert!(runner.calls.lock().expect("calls").is_empty());
+}
+
+#[test]
+fn rejects_unsafe_imported_flags_before_running_tools() {
+    for unsafe_flag in [
+        "-Wa,-a=outside.lst",
+        "@outside.rsp",
+        "-specs=outside.specs",
+        "-fplugin=outside.dylib",
+        "-wrapper",
+        "-mcpu=cortex-m0",
+        "-Wl,-o,outside.elf",
+    ] {
+        let temp = copy_fixture();
+        let cproj = temp.path().join("valid/project.cproj");
+        let text = fs::read_to_string(&cproj).expect("read project").replace(
+            "-pipe -std=gnu99",
+            &format!("-pipe {unsafe_flag} -std=gnu99"),
+        );
+        fs::write(&cproj, text).expect("write unsafe project");
+        let runner = FakeRunner::successful();
+        let error = build(
+            &cproj,
+            Configuration::Debug,
+            &tools(temp.path()),
+            &runner,
+            &CancellationToken::new(),
+        )
+        .expect_err("reject unsafe flag");
+        assert_eq!(error.code(), "UNSAFE_IMPORTED_FLAG", "flag {unsafe_flag}");
+        assert!(runner.calls.lock().expect("calls").is_empty());
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn rejects_hard_linked_output_without_changing_external_file() {
+    let temp = copy_fixture();
+    let project = temp.path().join("valid");
+    let build_dir = project.join(".samdebug/build/Debug");
+    fs::create_dir_all(&build_dir).expect("build directory");
+    let external = temp.path().join("sentinel");
+    fs::write(&external, b"unchanged sentinel").expect("sentinel");
+    fs::hard_link(&external, build_dir.join("fixture firmware-Debug.map"))
+        .expect("hard-linked map");
+    let runner = FakeRunner::successful();
+    let error = build(
+        &project.join("project.cproj"),
+        Configuration::Debug,
+        &tools(temp.path()),
+        &runner,
+        &CancellationToken::new(),
+    )
+    .expect_err("reject hard-linked target");
+    assert_eq!(error.code(), "UNSAFE_OUTPUT_PATH");
+    assert_eq!(
+        fs::read(external).expect("sentinel after"),
+        b"unchanged sentinel"
+    );
+}
+
+#[test]
+fn compiler_identity_invalidates_incremental_objects() {
+    let temp = copy_fixture();
+    let project = temp.path().join("valid");
+    let tool_paths = tools(temp.path());
+    let runner = FakeRunner::successful();
+    let token = CancellationToken::new();
+    let first = build(
+        &project.join("project.cproj"),
+        Configuration::Debug,
+        &tool_paths,
+        &runner,
+        &token,
+    )
+    .expect("first build");
+    assert_eq!(first.compiled, 4);
+    fs::write(&tool_paths.gcc, b"different compiler identity").expect("replace compiler");
+    let second = build(
+        &project.join("project.cproj"),
+        Configuration::Debug,
+        &tool_paths,
+        &runner,
+        &token,
+    )
+    .expect("compiler change rebuild");
+    assert_eq!(second.compiled, 4);
+    assert_eq!(second.reused, 0);
+}
+
+#[test]
+fn rejects_missing_outputs_and_wrong_elf_target() {
+    let temp = copy_fixture();
+    let project = temp.path().join("valid");
+    let tool_paths = tools(temp.path());
+    let missing = FakeRunner {
+        create_outputs: false,
+        ..FakeRunner::successful()
+    };
+    assert_eq!(
+        build(
+            &project.join("project.cproj"),
+            Configuration::Debug,
+            &tool_paths,
+            &missing,
+            &CancellationToken::new()
+        )
+        .expect_err("missing object")
+        .code(),
+        "EXPECTED_OUTPUT_MISSING"
+    );
+
+    let wrong_target = FakeRunner {
+        entry: "file format elf32-littlearm\narchitecture: armv6-m\nstart address 0x00400101\nprivate flags = 0x5000400: [Version5 EABI] [hard-float ABI]\n",
+        ..FakeRunner::successful()
+    };
+    let build_dir = project.join(".samdebug/build/Debug");
+    fs::create_dir_all(&build_dir).expect("build directory");
+    let old_elf = build_dir.join("fixture firmware-Debug.elf");
+    let old_map = build_dir.join("fixture firmware-Debug.map");
+    fs::write(&old_elf, b"previous validated ELF").expect("old ELF");
+    fs::write(&old_map, b"previous validated map").expect("old map");
+    assert_eq!(
+        build(
+            &project.join("project.cproj"),
+            Configuration::Debug,
+            &tool_paths,
+            &wrong_target,
+            &CancellationToken::new()
+        )
+        .expect_err("wrong target")
+        .code(),
+        "INVALID_ELF_TARGET"
+    );
+    assert_eq!(
+        fs::read(old_elf).expect("preserved ELF"),
+        b"previous validated ELF"
+    );
+    assert_eq!(
+        fs::read(old_map).expect("preserved map"),
+        b"previous validated map"
+    );
 }
