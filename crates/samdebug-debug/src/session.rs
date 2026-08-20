@@ -159,6 +159,15 @@ pub struct MemoryBlock {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DisassemblyInstruction {
+    pub address: u64,
+    pub function: Option<String>,
+    pub offset: Option<u64>,
+    pub instruction: String,
+    pub opcodes: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct SessionEngine<T: DebuggerTransport> {
     transport: T,
@@ -529,6 +538,39 @@ impl<T: DebuggerTransport> SessionEngine<T> {
             ));
         }
         Ok(MemoryBlock { address, bytes })
+    }
+
+    pub fn disassemble(
+        &mut self,
+        address: u64,
+        byte_length: usize,
+    ) -> SamdebugResult<Vec<DisassemblyInstruction>> {
+        self.require(&[SessionState::Halted], "disassembly.list")?;
+        if byte_length == 0 || byte_length > 4096 {
+            return Err(debug_error(
+                "DISASSEMBLY_RANGE_INVALID",
+                "disassembly byte length must be 1..=4096",
+            ));
+        }
+        let end = address
+            .checked_add(u64::try_from(byte_length).expect("bounded length fits u64"))
+            .ok_or_else(|| debug_error("DISASSEMBLY_RANGE_INVALID", "address range overflow"))?;
+        let output = self.run_done(
+            &format!("-data-disassemble -s 0x{address:x} -e 0x{end:x} -- 0"),
+            false,
+        )?;
+        Ok(list_values(result(&output.results, "asm_insns"))
+            .filter_map(as_tuple)
+            .filter_map(|tuple| {
+                Some(DisassemblyInstruction {
+                    address: parse_address(const_result(tuple, "address")?)?,
+                    function: const_result(tuple, "func-name").map(str::to_owned),
+                    offset: const_result(tuple, "offset").and_then(|value| value.parse().ok()),
+                    instruction: const_result(tuple, "inst").unwrap_or_default().to_owned(),
+                    opcodes: const_result(tuple, "opcodes").map(str::to_owned),
+                })
+            })
+            .collect())
     }
 
     pub fn load_firmware(&mut self, authorization: &str) -> SamdebugResult<()> {
@@ -1311,6 +1353,37 @@ mod tests {
         );
         assert_eq!(engine.load_firmware("wrong").unwrap_err().exit_code(), 8);
         engine.load_firmware("firmware.load:ATML123").expect("load");
+    }
+
+    #[test]
+    fn parses_bounded_disassembly_results() {
+        let disassembly = list_output(
+            "asm_insns",
+            vec![tuple(&[
+                ("address", "0x00400100"),
+                ("func-name", "main"),
+                ("offset", "4"),
+                ("inst", "push {r7, lr}"),
+                ("opcodes", "b580"),
+            ])],
+        );
+        let mut engine = SessionEngine::new(started_transport(vec![disassembly]));
+        start(&mut engine);
+        let instructions = engine.disassemble(0x0040_0100, 96).expect("disassembly");
+        assert_eq!(instructions.len(), 1);
+        assert_eq!(instructions[0].address, 0x0040_0100);
+        assert_eq!(instructions[0].function.as_deref(), Some("main"));
+        assert_eq!(instructions[0].offset, Some(4));
+        assert_eq!(instructions[0].instruction, "push {r7, lr}");
+        assert_eq!(instructions[0].opcodes.as_deref(), Some("b580"));
+        assert_eq!(
+            engine.transport.commands.last().map(String::as_str),
+            Some("-data-disassemble -s 0x400100 -e 0x400160 -- 0")
+        );
+        assert_eq!(
+            engine.disassemble(0, 0).unwrap_err().code(),
+            "DISASSEMBLY_RANGE_INVALID"
+        );
     }
 
     #[test]

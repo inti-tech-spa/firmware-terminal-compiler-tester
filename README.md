@@ -15,7 +15,6 @@ report is committed under `docs/audits/`.
 
 ## Status
 
-M0 (architecture/contracts) and M1 (Rust core/CLI foundation) are independently
-approved. M2's secure installer, doctor, production Arm toolchain record, and
-reproducible OpenOCD release are implemented and awaiting final independent
-approval; see `docs/setup.md`.
+M0 through M6 are independently approved. M7 integrates the native TUI, NDJSON
+agent protocol, and Apple Silicon release packaging and is undergoing its final
+implementation and audit gate. See `docs/debugging.md` and `docs/release.md`.

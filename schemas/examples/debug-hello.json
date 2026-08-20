@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "kind": "event",
+  "event": "hello",
+  "payload": {
+    "protocol_version": 1,
+    "capabilities": [
+      "session.start",
+      "session.stop",
+      "target.halt",
+      "target.continue",
+      "target.reset",
+      "target.step",
+      "target.next",
+      "breakpoint.insert",
+      "breakpoint.remove",
+      "stack.list",
+      "variables.list",
+      "registers.read",
+      "memory.read",
+      "firmware.load"
+    ]
+  }
+}

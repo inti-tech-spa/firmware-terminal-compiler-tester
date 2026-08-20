@@ -7,6 +7,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+crossterm.workspace = true
+ratatui.workspace = true
 samdebug-core = { version = "=0.1.0", path = "../samdebug-core" }
 samdebug-debug = { version = "=0.1.0", path = "../samdebug-debug" }
 

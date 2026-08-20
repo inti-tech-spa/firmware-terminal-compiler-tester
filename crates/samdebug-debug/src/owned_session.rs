@@ -38,9 +38,9 @@ impl DebugCancellationController {
 }
 
 use crate::{
-    Breakpoint, FirmwareArtifact, GdbMiConfig, GdbMiProcess, MemoryBlock, OpenOcdConfig,
-    OpenOcdDebugServer, RegisterValue, SessionEngine, SessionEvent, SessionState, StackFrame,
-    Variable, list_probes,
+    Breakpoint, DisassemblyInstruction, FirmwareArtifact, GdbMiConfig, GdbMiProcess, MemoryBlock,
+    OpenOcdConfig, OpenOcdDebugServer, RegisterValue, SessionEngine, SessionEvent, SessionState,
+    StackFrame, Variable, list_probes,
 };
 
 #[derive(Debug)]
@@ -292,6 +292,14 @@ impl OwnedDebugSession {
 
     pub fn read_memory(&mut self, address: u64, length: usize) -> SamdebugResult<MemoryBlock> {
         self.execute(|engine| engine.read_memory(address, length))
+    }
+
+    pub fn disassemble(
+        &mut self,
+        address: u64,
+        byte_length: usize,
+    ) -> SamdebugResult<Vec<DisassemblyInstruction>> {
+        self.execute(|engine| engine.disassemble(address, byte_length))
     }
 
     pub fn load_firmware(&mut self, authorization: &str) -> SamdebugResult<()> {

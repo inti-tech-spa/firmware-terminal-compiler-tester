@@ -1,4 +1,5 @@
 use std::{
+    io::{BufRead, BufReader, Write},
     path::Path,
     process::{Command, Stdio},
     thread,
@@ -206,6 +207,63 @@ fn invalid_command_in_json_mode_is_structured_and_stdout_clean() {
 }
 
 #[test]
+fn agent_stdio_is_noninteractive_ndjson_and_recovers_after_bad_input() {
+    let temp = TempDir::new().expect("tempdir");
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../samdebug-project/tests/fixtures");
+    copy_tree(&fixtures, temp.path());
+    let project = temp.path().join("valid");
+    let false_tool = "/usr/bin/false";
+    let config = format!(
+        r#"schema_version = 1
+[project]
+kind = "microchip-studio-cproj"
+path = "project.cproj"
+configuration = "Debug"
+device = "ATSAM4SD32C"
+[tools]
+channel = "system"
+[tools.system]
+gcc = {false_tool:?}
+gdb = {false_tool:?}
+openocd = {false_tool:?}
+objcopy = {false_tool:?}
+objdump = {false_tool:?}
+size = {false_tool:?}
+[probe]
+kind = "atmel-ice"
+transport = "swd"
+"#,
+    );
+    std::fs::write(project.join("samdebug.toml"), config).expect("write config");
+    let mut process = Command::new(env!("CARGO_BIN_EXE_samdebug"))
+        .args(["debug", "--agent", "--stdio"])
+        .current_dir(&project)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn agent mode");
+    process
+        .stdin
+        .take()
+        .expect("agent stdin")
+        .write_all(b"not-json\n")
+        .expect("write malformed request and close stdin");
+    let output = process.wait_with_output().expect("wait for agent");
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let messages = String::from_utf8(output.stdout)
+        .expect("UTF-8 NDJSON")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid JSON line"))
+        .collect::<Vec<_>>();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["event"], "hello");
+    assert_eq!(messages[1]["event"], "protocol.error");
+    assert_eq!(messages[1]["payload"]["code"], "REQUEST_INVALID");
+}
+
+#[test]
 fn sigint_cancels_work_reaps_child_and_returns_130() {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -408,6 +466,91 @@ fn copy_tree(source: &Path, destination: &Path) {
             copy_tree(&entry.path(), &target);
         } else {
             std::fs::copy(entry.path(), target).expect("copy fixture file");
+        }
+    }
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "requires a connected Atmel-ICE/ATSAM4SD32C, managed ELF, and exact firmware-load authorization"]
+fn physical_agent_stdio_debug_workflow_and_cleanup() {
+    let project = std::env::var("SAMDEBUG_PHYSICAL_PROJECT").expect("physical project path");
+    let serial = std::env::var("SAMDEBUG_PHYSICAL_PROBE_SERIAL").expect("probe serial");
+    assert_eq!(
+        std::env::var("SAMDEBUG_PHYSICAL_LOAD_CONFIRM").expect("load confirmation"),
+        format!("firmware.load:{serial}")
+    );
+    let mut process = Command::new(env!("CARGO_BIN_EXE_samdebug"))
+        .args(["debug", "--agent", "--stdio"])
+        .current_dir(&project)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn physical agent");
+    let mut input = process.stdin.take().expect("agent stdin");
+    let mut output = BufReader::new(process.stdout.take().expect("agent stdout"));
+    let hello = read_agent_message(&mut output);
+    assert_eq!(hello["event"], "hello");
+
+    let requests = [
+        serde_json::json!({"schema_version":1,"kind":"request","id":1,"operation":"session.start","payload":{"probe_serial":serial}}),
+        serde_json::json!({"schema_version":1,"kind":"request","id":2,"operation":"breakpoint.insert","payload":{"location":"main","temporary":true}}),
+        serde_json::json!({"schema_version":1,"kind":"request","id":3,"operation":"target.continue","payload":{}}),
+    ];
+    for request in requests {
+        writeln!(input, "{request}").expect("write agent request");
+        let response = read_agent_response(&mut output, &request["id"]);
+        assert_eq!(response["ok"], true, "{response}");
+    }
+    let stopped = read_agent_event(&mut output, "stopped");
+    assert_eq!(stopped["payload"]["reason"], "breakpoint");
+
+    let remaining = [
+        serde_json::json!({"schema_version":1,"kind":"request","id":4,"operation":"stack.list","payload":{}}),
+        serde_json::json!({"schema_version":1,"kind":"request","id":5,"operation":"registers.read","payload":{"names":["pc","sp"]}}),
+        serde_json::json!({"schema_version":1,"kind":"request","id":6,"operation":"target.step","payload":{}}),
+        serde_json::json!({"schema_version":1,"kind":"request","id":7,"operation":"target.next","payload":{}}),
+        serde_json::json!({"schema_version":1,"kind":"request","id":8,"operation":"target.reset","payload":{"halt":true}}),
+        serde_json::json!({"schema_version":1,"kind":"request","id":9,"operation":"firmware.load","payload":{"authorization":{"operation":"firmware.load","probe_serial":serial}}}),
+        serde_json::json!({"schema_version":1,"kind":"request","id":10,"operation":"session.stop","payload":{}}),
+    ];
+    for request in remaining {
+        writeln!(input, "{request}").expect("write agent request");
+        let response = read_agent_response(&mut output, &request["id"]);
+        assert_eq!(response["ok"], true, "{response}");
+    }
+    drop(input);
+    let result = process.wait_with_output().expect("wait for physical agent");
+    assert!(
+        result.status.success(),
+        "agent exited {:?}: {}",
+        result.status.code(),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(result.stderr.is_empty());
+}
+
+fn read_agent_message(reader: &mut impl BufRead) -> serde_json::Value {
+    let mut line = String::new();
+    assert_ne!(reader.read_line(&mut line).expect("read agent line"), 0);
+    serde_json::from_str(&line).expect("valid agent JSON")
+}
+
+fn read_agent_response(reader: &mut impl BufRead, id: &serde_json::Value) -> serde_json::Value {
+    loop {
+        let message = read_agent_message(reader);
+        if message["kind"] == "response" && &message["id"] == id {
+            return message;
+        }
+    }
+}
+
+fn read_agent_event(reader: &mut impl BufRead, name: &str) -> serde_json::Value {
+    loop {
+        let message = read_agent_message(reader);
+        if message["kind"] == "event" && message["event"] == name {
+            return message;
         }
     }
 }

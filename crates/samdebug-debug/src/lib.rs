@@ -17,6 +17,6 @@ pub use programming::{
     ProgramOperation, ProgrammingReport, list_probes,
 };
 pub use session::{
-    Breakpoint, DebuggerTransport, MemoryBlock, MiCommandOutput, RegisterValue, SessionEngine,
-    SessionEvent, SessionState, StackFrame, Variable,
+    Breakpoint, DebuggerTransport, DisassemblyInstruction, MemoryBlock, MiCommandOutput,
+    RegisterValue, SessionEngine, SessionEvent, SessionState, StackFrame, Variable,
 };

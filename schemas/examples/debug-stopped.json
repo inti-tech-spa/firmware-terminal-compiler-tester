@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "kind": "event",
+  "event": "stopped",
+  "payload": {
+    "generation": 4,
+    "reason": "breakpoint",
+    "frame": {
+      "index": 0,
+      "function": "main",
+      "file": null,
+      "line": null,
+      "address": 4194560
+    }
+  }
+}

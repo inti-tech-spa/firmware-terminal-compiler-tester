@@ -1,4 +1,25 @@
-# GDB/MI debugging engine
+# Terminal debugging
+
+`samdebug debug` starts the native Ratatui interface. It displays source and
+disassembly around the current instruction, stack, locals, named registers,
+breakpoints, target output, OpenOCD/GDB logs, status, and keyboard help. It
+falls back to a resize message below 70×20 cells. `Tab` moves between panes;
+`c`, `h`, `s`, `n`, and `r` continue, halt, step, next, and reset-halt; `b` and
+`d` insert and remove breakpoints; `l` opens a firmware-load modal that requires
+typing the exact `firmware.load:<probe-serial>` authorization; and `q` shuts
+down the owned session. Normal exit, Ctrl-C, errors,
+and unwinding restore raw mode and the alternate screen.
+
+`samdebug debug --agent --stdio` starts the noninteractive NDJSON protocol from
+`schemas/debug-v1.schema.json`. Standard output contains only one JSON message
+per line; diagnostic logging stays on standard error. The process emits a
+`hello` event, accepts versioned requests, returns one response per valid
+request, and can emit generation-bearing asynchronous events. Malformed or
+oversized input produces `protocol.error` without prompting. EOF requests a
+clean shutdown. Firmware loading requires an exact
+`firmware.load:<probe-serial>` authorization in its request payload.
+
+## Shared GDB/MI engine
 
 The M06 engine owns a persistent loopback-only OpenOCD server and a managed
 `arm-none-eabi-gdb --interpreter=mi2 --nx --quiet` child. OpenOCD uses the exact
@@ -20,7 +41,7 @@ monotonically increasing generation rather than resetting the counter in a new
 engine instance.
 
 The shared `SessionEngine` is the only command/state implementation used by
-future TUI and agent frontends. It supports continue, halt, reset-halt, source
+the TUI and agent frontends. It supports continue, halt, reset-halt, source
 step, next, permanent and temporary breakpoints, stack frames, frame variables,
 named registers, and memory reads of at most 65,536 bytes. All command and idle
 poll paths use the same MI record dispatcher, so target stdout and GDB

@@ -1,21 +1,39 @@
-use std::{ffi::OsString, path::PathBuf, process::ExitCode, time::Duration};
+#[cfg(debug_assertions)]
+use std::time::Duration;
+use std::{
+    ffi::OsString,
+    path::PathBuf,
+    process::ExitCode,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Duration as StdDuration,
+};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
+#[cfg(debug_assertions)]
+use samdebug_core::ports::{CommandSpec, DownloadReceipt, Downloader, ProcessRunner};
 use samdebug_core::{
     CancellationToken, Configuration, ErrorCategory, FiniteResult, SamdebugConfig, SamdebugError,
-    SamdebugResult,
-    ports::{CommandSpec, DownloadReceipt, Downloader, FileSystem, ProcessRunner},
+    SamdebugResult, ports::FileSystem,
 };
 use samdebug_debug::{
-    FirmwareArtifact, OpenOcdConfig, OpenOcdProgrammer, ProgramOperation, list_probes,
+    FirmwareArtifact, GdbMiConfig, OpenOcdConfig, OpenOcdProgrammer, OwnedDebugSession,
+    ProgramOperation, list_probes,
 };
 use samdebug_project::{BuildToolPaths, artifacts, build, clean, import_cproj, initialize_project};
+#[cfg(debug_assertions)]
+use samdebug_tools::ChildSupervisor;
 use samdebug_tools::{
-    ChildSupervisor, CurlDownloader, Installer, MacUsbProbeProvider, Platform, SystemProcessRunner,
-    ToolManifest, run_doctor, run_system_doctor,
+    CurlDownloader, Installer, MacUsbProbeProvider, Platform, SystemProcessRunner, ToolManifest,
+    run_doctor, run_system_doctor,
 };
 use serde::Serialize;
 use serde_json::json;
+
+mod agent;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum OutputFormat {
@@ -55,8 +73,10 @@ enum Command {
     Erase(AuthorizedArgs),
     Flash(AuthorizedArgs),
     Debug(DebugArgs),
+    #[cfg(debug_assertions)]
     #[command(name = "__test-block", hide = true)]
     InternalTestBlock,
+    #[cfg(debug_assertions)]
     #[command(name = "__test-setup-cancel", hide = true)]
     InternalTestSetupCancel,
 }
@@ -107,6 +127,12 @@ fn main() -> ExitCode {
     if let Err(error) = ctrlc::set_handler(move || signal_token.cancel()) {
         eprintln!("failed to install signal handler: {error}");
         return ExitCode::from(2);
+    }
+
+    if let Command::Debug(args) = &cli.command
+        && args.agent
+    {
+        return run_agent_mode(&cancellation);
     }
 
     match dispatch(&cli, &cancellation) {
@@ -268,7 +294,7 @@ fn dispatch(
                 )
             })
             .map_err(|error| ("artifacts", error)),
-        Command::Debug(args) if !args.agent => samdebug_tui::run()
+        Command::Debug(args) if !args.agent => debug_tui_command(cancellation)
             .map(|()| ("debug", json!({})))
             .map_err(|error| ("debug", error)),
         Command::Probe {
@@ -283,9 +309,11 @@ fn dispatch(
             .map_err(|error| ("probe", error)),
         Command::Erase(args) => programming_command(ProgramOperation::Erase, args, cancellation),
         Command::Flash(args) => programming_command(ProgramOperation::Flash, args, cancellation),
+        #[cfg(debug_assertions)]
         Command::InternalTestBlock => run_internal_blocking_test(cancellation)
             .map(|code| ("__test-block", json!({"child_exit_code": code})))
             .map_err(|error| ("__test-block", error)),
+        #[cfg(debug_assertions)]
         Command::InternalTestSetupCancel => run_internal_setup_cancel(cancellation)
             .map(|report| {
                 (
@@ -301,6 +329,130 @@ fn dispatch(
                 "NOT_IMPLEMENTED",
                 "command is reserved for a later audited milestone",
             ),
+        )),
+    }
+}
+
+fn run_agent_mode(cancellation: &CancellationToken) -> ExitCode {
+    let result = debug_context().and_then(|(context, _)| agent::run(&context, cancellation));
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            let code = error.exit_code();
+            let _ = agent::emit_fatal(&error);
+            ExitCode::from(u8::try_from(code).unwrap_or(1))
+        }
+    }
+}
+
+fn debug_tui_command(cancellation: &CancellationToken) -> SamdebugResult<()> {
+    let (context, configured_serial) = debug_context()?;
+    let serial = select_debug_probe(configured_serial.as_deref())?;
+    let session_cancellation = CancellationToken::new();
+    let startup_forwarder = CancellationForwarder::start(cancellation, &session_cancellation);
+    let session = OwnedDebugSession::launch(
+        &MacUsbProbeProvider,
+        &context.openocd,
+        &context.gdb,
+        &serial,
+        &context.firmware,
+        &session_cancellation,
+    )?;
+    drop(startup_forwarder);
+    samdebug_tui::run(session, serial, cancellation)
+}
+
+#[derive(Debug)]
+struct CancellationForwarder {
+    stop: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl CancellationForwarder {
+    fn start(external: &CancellationToken, local: &CancellationToken) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let external = external.clone();
+        let local = local.clone();
+        let worker = thread::spawn(move || {
+            while !worker_stop.load(Ordering::SeqCst) {
+                if external.is_cancelled() {
+                    local.cancel();
+                    break;
+                }
+                thread::sleep(StdDuration::from_millis(10));
+            }
+        });
+        Self {
+            stop,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for CancellationForwarder {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn debug_context() -> SamdebugResult<(agent::AgentContext, Option<String>)> {
+    let (root, config) = project_command_context()?;
+    let project_file = root.join(&config.project.path);
+    let imported = import_cproj(&project_file, config.project.configuration)?;
+    let build_directory = root
+        .join(".samdebug/build")
+        .join(&imported.plan.configuration);
+    let firmware = FirmwareArtifact {
+        path: build_directory.join(format!(
+            "{}{}",
+            imported.plan.output_name, imported.plan.output_extension
+        )),
+        build_directory,
+    };
+    let gdb_executable = if let Some(system) = config.tools.system.as_ref() {
+        PathBuf::from(&system.gdb)
+    } else {
+        managed_root()?.join("tools/arm-gnu-toolchain/15.2.Rel1/bin/arm-none-eabi-gdb")
+    };
+    let mut gdb = GdbMiConfig::new(gdb_executable);
+    gdb.current_directory = Some(root);
+    Ok((
+        agent::AgentContext {
+            openocd: resolve_openocd(&config)?,
+            gdb,
+            firmware,
+        },
+        config.probe.serial,
+    ))
+}
+
+fn select_debug_probe(configured_serial: Option<&str>) -> SamdebugResult<String> {
+    let probes = list_probes(&MacUsbProbeProvider)?.probes;
+    if let Some(serial) = configured_serial {
+        if probes.iter().any(|probe| probe.serial == serial) {
+            return Ok(serial.to_owned());
+        }
+        return Err(SamdebugError::new(
+            ErrorCategory::Connection,
+            "PROBE_SERIAL_NOT_FOUND",
+            format!("configured Atmel-ICE probe {serial} was not found"),
+        ));
+    }
+    match probes.as_slice() {
+        [probe] => Ok(probe.serial.clone()),
+        [] => Err(SamdebugError::new(
+            ErrorCategory::Connection,
+            "PROBE_NOT_FOUND",
+            "no Atmel-ICE probe was found",
+        )),
+        _ => Err(SamdebugError::new(
+            ErrorCategory::Connection,
+            "MULTIPLE_PROBES",
+            "multiple Atmel-ICE probes were found; set probe.serial in samdebug.toml",
         )),
     }
 }
@@ -522,16 +674,20 @@ fn command_name(command: &Command) -> &'static str {
         Command::Erase(_) => "erase",
         Command::Flash(_) => "flash",
         Command::Debug(_) => "debug",
+        #[cfg(debug_assertions)]
         Command::InternalTestBlock => "__test-block",
+        #[cfg(debug_assertions)]
         Command::InternalTestSetupCancel => "__test-setup-cancel",
     }
 }
 
+#[cfg(debug_assertions)]
 #[derive(Debug)]
 struct SlowTestDownloader {
     ready_file: PathBuf,
 }
 
+#[cfg(debug_assertions)]
 impl Downloader for SlowTestDownloader {
     fn download(
         &self,
@@ -563,6 +719,7 @@ impl Downloader for SlowTestDownloader {
     }
 }
 
+#[cfg(debug_assertions)]
 fn run_internal_setup_cancel(
     cancellation: &CancellationToken,
 ) -> Result<samdebug_tools::InstallReport, SamdebugError> {
@@ -625,6 +782,7 @@ fn run_internal_setup_cancel(
     .install(&manifest, false)
 }
 
+#[cfg(debug_assertions)]
 fn run_internal_blocking_test(cancellation: &CancellationToken) -> Result<i32, SamdebugError> {
     let runner = SystemProcessRunner;
     let child = runner.spawn(&CommandSpec {

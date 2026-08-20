@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "kind": "response",
+  "id": "request-7",
+  "operation": "firmware.load",
+  "ok": false,
+  "error": {
+    "code": "AUTHORIZATION_REJECTED",
+    "message": "authorization does not match the selected probe",
+    "exit_code": 8
+  }
+}

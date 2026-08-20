@@ -40,20 +40,20 @@
       },
       "additionalProperties": false,
       "allOf": [
-        { "if": { "$ref": "#/$defs/isSessionStart" }, "then": { "properties": { "payload": { "$ref": "#/$defs/sessionStartPayload" } } } },
-        { "if": { "$ref": "#/$defs/isSessionStop" }, "then": { "properties": { "payload": { "$ref": "#/$defs/emptyPayload" } } } },
-        { "if": { "$ref": "#/$defs/isTargetHalt" }, "then": { "properties": { "payload": { "$ref": "#/$defs/emptyPayload" } } } },
-        { "if": { "$ref": "#/$defs/isTargetContinue" }, "then": { "properties": { "payload": { "$ref": "#/$defs/emptyPayload" } } } },
-        { "if": { "$ref": "#/$defs/isTargetReset" }, "then": { "properties": { "payload": { "$ref": "#/$defs/resetPayload" } } } },
-        { "if": { "$ref": "#/$defs/isTargetStep" }, "then": { "properties": { "payload": { "$ref": "#/$defs/emptyPayload" } } } },
-        { "if": { "$ref": "#/$defs/isTargetNext" }, "then": { "properties": { "payload": { "$ref": "#/$defs/emptyPayload" } } } },
-        { "if": { "$ref": "#/$defs/isBreakpointInsert" }, "then": { "properties": { "payload": { "$ref": "#/$defs/breakpointInsertPayload" } } } },
-        { "if": { "$ref": "#/$defs/isBreakpointRemove" }, "then": { "properties": { "payload": { "$ref": "#/$defs/breakpointRemovePayload" } } } },
-        { "if": { "$ref": "#/$defs/isStackList" }, "then": { "properties": { "payload": { "$ref": "#/$defs/stackListPayload" } } } },
-        { "if": { "$ref": "#/$defs/isVariablesList" }, "then": { "properties": { "payload": { "$ref": "#/$defs/variablesListPayload" } } } },
-        { "if": { "$ref": "#/$defs/isRegistersRead" }, "then": { "properties": { "payload": { "$ref": "#/$defs/registersReadPayload" } } } },
-        { "if": { "$ref": "#/$defs/isMemoryRead" }, "then": { "properties": { "payload": { "$ref": "#/$defs/memoryReadPayload" } } } },
-        { "if": { "$ref": "#/$defs/isFirmwareLoad" }, "then": { "properties": { "payload": { "$ref": "#/$defs/firmwareLoadPayload" } } } }
+        { "if": { "$ref": "#/$defs/isSessionStart" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/sessionStartPayload" } } } },
+        { "if": { "$ref": "#/$defs/isSessionStop" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/emptyPayload" } } } },
+        { "if": { "$ref": "#/$defs/isTargetHalt" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/emptyPayload" } } } },
+        { "if": { "$ref": "#/$defs/isTargetContinue" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/emptyPayload" } } } },
+        { "if": { "$ref": "#/$defs/isTargetReset" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/resetPayload" } } } },
+        { "if": { "$ref": "#/$defs/isTargetStep" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/emptyPayload" } } } },
+        { "if": { "$ref": "#/$defs/isTargetNext" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/emptyPayload" } } } },
+        { "if": { "$ref": "#/$defs/isBreakpointInsert" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/breakpointInsertPayload" } } } },
+        { "if": { "$ref": "#/$defs/isBreakpointRemove" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/breakpointRemovePayload" } } } },
+        { "if": { "$ref": "#/$defs/isStackList" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/stackListPayload" } } } },
+        { "if": { "$ref": "#/$defs/isVariablesList" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/variablesListPayload" } } } },
+        { "if": { "$ref": "#/$defs/isRegistersRead" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/registersReadPayload" } } } },
+        { "if": { "$ref": "#/$defs/isMemoryRead" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/memoryReadPayload" } } } },
+        { "if": { "$ref": "#/$defs/isFirmwareLoad" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/firmwareLoadPayload" } } } }
       ]
     },
     "responseBase": {
@@ -63,7 +63,7 @@
         "schema_version": { "const": 1 },
         "kind": { "const": "response" },
         "id": { "$ref": "#/$defs/id" },
-        "operation": { "$ref": "#/$defs/operation" },
+        "operation": { "type": "string", "minLength": 1 },
         "ok": { "type": "boolean" }
       }
     },
@@ -75,25 +75,25 @@
           "required": ["result"],
           "properties": {
             "schema_version": { "const": 1 }, "kind": { "const": "response" },
-            "id": { "$ref": "#/$defs/id" }, "operation": { "$ref": "#/$defs/operation" },
+            "id": { "$ref": "#/$defs/id" }, "operation": { "type": "string", "minLength": 1 },
             "ok": { "const": true }, "result": {}
           },
           "additionalProperties": false
         },
-        { "if": { "$ref": "#/$defs/isSessionStart" }, "then": { "properties": { "result": { "$ref": "#/$defs/sessionStartResult" } } } },
-        { "if": { "$ref": "#/$defs/isSessionStop" }, "then": { "properties": { "result": { "$ref": "#/$defs/idleResult" } } } },
-        { "if": { "$ref": "#/$defs/isTargetHalt" }, "then": { "properties": { "result": { "$ref": "#/$defs/haltedResult" } } } },
-        { "if": { "$ref": "#/$defs/isTargetContinue" }, "then": { "properties": { "result": { "$ref": "#/$defs/runningResult" } } } },
-        { "if": { "$ref": "#/$defs/isTargetReset" }, "then": { "properties": { "result": { "$ref": "#/$defs/haltedResult" } } } },
-        { "if": { "$ref": "#/$defs/isTargetStep" }, "then": { "properties": { "result": { "$ref": "#/$defs/haltedResult" } } } },
-        { "if": { "$ref": "#/$defs/isTargetNext" }, "then": { "properties": { "result": { "$ref": "#/$defs/haltedResult" } } } },
-        { "if": { "$ref": "#/$defs/isBreakpointInsert" }, "then": { "properties": { "result": { "$ref": "#/$defs/breakpointResult" } } } },
-        { "if": { "$ref": "#/$defs/isBreakpointRemove" }, "then": { "properties": { "result": { "$ref": "#/$defs/breakpointRemoveResult" } } } },
-        { "if": { "$ref": "#/$defs/isStackList" }, "then": { "properties": { "result": { "$ref": "#/$defs/stackResult" } } } },
-        { "if": { "$ref": "#/$defs/isVariablesList" }, "then": { "properties": { "result": { "$ref": "#/$defs/variablesResult" } } } },
-        { "if": { "$ref": "#/$defs/isRegistersRead" }, "then": { "properties": { "result": { "$ref": "#/$defs/registersResult" } } } },
-        { "if": { "$ref": "#/$defs/isMemoryRead" }, "then": { "properties": { "result": { "$ref": "#/$defs/memoryResult" } } } },
-        { "if": { "$ref": "#/$defs/isFirmwareLoad" }, "then": { "properties": { "result": { "$ref": "#/$defs/loadResult" } } } }
+        { "if": { "$ref": "#/$defs/isSessionStart" }, "then": { "type": "object", "properties": { "result": { "$ref": "#/$defs/sessionStartResult" } } } },
+        { "if": { "$ref": "#/$defs/isSessionStop" }, "then": { "type": "object", "properties": { "result": { "$ref": "#/$defs/idleResult" } } } },
+        { "if": { "$ref": "#/$defs/isTargetHalt" }, "then": { "type": "object", "properties": { "result": { "$ref": "#/$defs/haltedResult" } } } },
+        { "if": { "$ref": "#/$defs/isTargetContinue" }, "then": { "type": "object", "properties": { "result": { "$ref": "#/$defs/runningResult" } } } },
+        { "if": { "$ref": "#/$defs/isTargetReset" }, "then": { "type": "object", "properties": { "result": { "$ref": "#/$defs/haltedResult" } } } },
+        { "if": { "$ref": "#/$defs/isTargetStep" }, "then": { "type": "object", "properties": { "result": { "$ref": "#/$defs/haltedResult" } } } },
+        { "if": { "$ref": "#/$defs/isTargetNext" }, "then": { "type": "object", "properties": { "result": { "$ref": "#/$defs/haltedResult" } } } },
+        { "if": { "$ref": "#/$defs/isBreakpointInsert" }, "then": { "type": "object", "properties": { "result": { "$ref": "#/$defs/breakpointResult" } } } },
+        { "if": { "$ref": "#/$defs/isBreakpointRemove" }, "then": { "type": "object", "properties": { "result": { "$ref": "#/$defs/breakpointRemoveResult" } } } },
+        { "if": { "$ref": "#/$defs/isStackList" }, "then": { "type": "object", "properties": { "result": { "$ref": "#/$defs/stackResult" } } } },
+        { "if": { "$ref": "#/$defs/isVariablesList" }, "then": { "type": "object", "properties": { "result": { "$ref": "#/$defs/variablesResult" } } } },
+        { "if": { "$ref": "#/$defs/isRegistersRead" }, "then": { "type": "object", "properties": { "result": { "$ref": "#/$defs/registersResult" } } } },
+        { "if": { "$ref": "#/$defs/isMemoryRead" }, "then": { "type": "object", "properties": { "result": { "$ref": "#/$defs/memoryResult" } } } },
+        { "if": { "$ref": "#/$defs/isFirmwareLoad" }, "then": { "type": "object", "properties": { "result": { "$ref": "#/$defs/loadResult" } } } }
       ]
     },
     "responseFailure": {
@@ -104,7 +104,7 @@
           "required": ["error"],
           "properties": {
             "schema_version": { "const": 1 }, "kind": { "const": "response" },
-            "id": { "$ref": "#/$defs/id" }, "operation": { "$ref": "#/$defs/operation" },
+            "id": { "$ref": "#/$defs/id" }, "operation": { "type": "string", "minLength": 1 },
             "ok": { "const": false }, "error": { "$ref": "#/$defs/error" }
           },
           "additionalProperties": false
@@ -133,26 +133,26 @@
       "required": ["schema_version", "kind", "event", "payload"],
       "properties": {
         "schema_version": { "const": 1 }, "kind": { "const": "event" },
-        "event": { "enum": ["probe.selected", "server.starting", "server.ready", "gdb.starting", "state", "running", "stopped", "reset", "loaded", "progress", "target.output", "log", "session.error", "session.stopped", "cancelled"] },
+        "event": { "enum": ["probe.selected", "server.starting", "server.ready", "gdb.starting", "state", "running", "stopped", "reset", "loaded", "progress", "target.output", "log", "session.error", "session.stopped", "cancelled", "protocol.error"] },
         "payload": { "type": "object" }
       },
       "additionalProperties": false,
       "allOf": [
-        { "if": { "$ref": "#/$defs/isProbeSelectedEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/probeSelectedEventPayload" } } } },
-        { "if": { "$ref": "#/$defs/isServerStartingEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/generationPayload" } } } },
-        { "if": { "$ref": "#/$defs/isServerReadyEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/serverReadyEventPayload" } } } },
-        { "if": { "$ref": "#/$defs/isGdbStartingEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/generationPayload" } } } },
-        { "if": { "$ref": "#/$defs/isStateEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/stateEventPayload" } } } },
-        { "if": { "$ref": "#/$defs/isRunningEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/generationPayload" } } } },
-        { "if": { "$ref": "#/$defs/isStoppedEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/stoppedEventPayload" } } } },
-        { "if": { "$ref": "#/$defs/isResetEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/generationPayload" } } } },
-        { "if": { "$ref": "#/$defs/isLoadedEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/loadedEventPayload" } } } },
-        { "if": { "$ref": "#/$defs/isProgressEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/progressEventPayload" } } } },
-        { "if": { "$ref": "#/$defs/isTargetOutputEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/targetOutputEventPayload" } } } },
-        { "if": { "$ref": "#/$defs/isLogEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/logEventPayload" } } } },
-        { "if": { "$ref": "#/$defs/isSessionErrorEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/sessionErrorEventPayload" } } } },
-        { "if": { "$ref": "#/$defs/isSessionStoppedEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/sessionStoppedEventPayload" } } } },
-        { "if": { "$ref": "#/$defs/isCancelledEvent" }, "then": { "properties": { "payload": { "$ref": "#/$defs/cancelledEventPayload" } } } }
+        { "if": { "$ref": "#/$defs/isProbeSelectedEvent" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/probeSelectedEventPayload" } } } },
+        { "if": { "$ref": "#/$defs/isServerStartingEvent" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/generationPayload" } } } },
+        { "if": { "$ref": "#/$defs/isServerReadyEvent" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/serverReadyEventPayload" } } } },
+        { "if": { "$ref": "#/$defs/isGdbStartingEvent" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/generationPayload" } } } },
+        { "if": { "$ref": "#/$defs/isStateEvent" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/stateEventPayload" } } } },
+        { "if": { "$ref": "#/$defs/isRunningEvent" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/generationPayload" } } } },
+        { "if": { "$ref": "#/$defs/isStoppedEvent" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/stoppedEventPayload" } } } },
+        { "if": { "$ref": "#/$defs/isResetEvent" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/generationPayload" } } } },
+        { "if": { "$ref": "#/$defs/isLoadedEvent" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/loadedEventPayload" } } } },
+        { "if": { "$ref": "#/$defs/isProgressEvent" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/progressEventPayload" } } } },
+        { "if": { "$ref": "#/$defs/isTargetOutputEvent" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/targetOutputEventPayload" } } } },
+        { "if": { "$ref": "#/$defs/isLogEvent" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/logEventPayload" } } } },
+        { "if": { "$ref": "#/$defs/isSessionErrorEvent" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/sessionErrorEventPayload" } } } },
+        { "if": { "$ref": "#/$defs/isSessionStoppedEvent" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/sessionStoppedEventPayload" } } } },
+        { "if": { "$ref": "#/$defs/isCancelledEvent" }, "then": { "type": "object", "properties": { "payload": { "$ref": "#/$defs/cancelledEventPayload" } } } }
       ]
     },
     "emptyPayload": { "type": "object", "additionalProperties": false },
@@ -207,7 +207,7 @@
     "idleResult": { "type": "object", "required": ["state"], "properties": { "state": { "const": "idle" } }, "additionalProperties": false },
     "haltedResult": {
       "type": "object", "required": ["state"],
-      "properties": { "state": { "const": "halted" }, "stop_reason": { "type": "string" }, "frame": { "$ref": "#/$defs/frame" } },
+      "properties": { "state": { "const": "halted" }, "stop_reason": { "type": "string" }, "frame": { "oneOf": [{ "$ref": "#/$defs/frame" }, { "type": "null" }] } },
       "additionalProperties": false
     },
     "runningResult": { "type": "object", "required": ["state"], "properties": { "state": { "const": "running" } }, "additionalProperties": false },
@@ -219,13 +219,13 @@
     "breakpointRemoveResult": { "type": "object", "required": ["removed_id"], "properties": { "removed_id": { "type": "string" } }, "additionalProperties": false },
     "frame": {
       "type": "object", "required": ["index", "function"],
-      "properties": { "index": { "type": "integer", "minimum": 0 }, "function": { "type": "string" }, "file": { "type": "string" }, "line": { "type": "integer", "minimum": 1 }, "address": { "type": "integer", "minimum": 0 } },
+      "properties": { "index": { "type": "integer", "minimum": 0 }, "function": { "type": "string" }, "file": { "type": ["string", "null"] }, "line": { "type": ["integer", "null"], "minimum": 1 }, "address": { "type": ["integer", "null"], "minimum": 0 } },
       "additionalProperties": false
     },
     "stackResult": { "type": "object", "required": ["frames"], "properties": { "frames": { "type": "array", "items": { "$ref": "#/$defs/frame" } } }, "additionalProperties": false },
     "variablesResult": {
       "type": "object", "required": ["variables"],
-      "properties": { "variables": { "type": "array", "items": { "type": "object", "required": ["name", "value"], "properties": { "name": { "type": "string" }, "value": { "type": "string" }, "type": { "type": "string" } }, "additionalProperties": false } } },
+      "properties": { "variables": { "type": "array", "items": { "type": "object", "required": ["name", "value"], "properties": { "name": { "type": "string" }, "value": { "type": "string" }, "type": { "type": ["string", "null"] } }, "additionalProperties": false } } },
       "additionalProperties": false
     },
     "registersResult": {
@@ -262,7 +262,7 @@
     },
     "stoppedEventPayload": {
       "type": "object", "required": ["generation", "reason"],
-      "properties": { "generation": { "type": "integer", "minimum": 1 }, "reason": { "enum": ["breakpoint", "step", "halt", "reset", "signal", "watchpoint", "unknown"] }, "frame": { "$ref": "#/$defs/frame" } },
+      "properties": { "generation": { "type": "integer", "minimum": 1 }, "reason": { "type": "string", "minLength": 1 }, "frame": { "oneOf": [{ "$ref": "#/$defs/frame" }, { "type": "null" }] } },
       "additionalProperties": false
     },
     "loadedEventPayload": {
@@ -330,10 +330,10 @@
     "isSessionStoppedEvent": { "type": "object", "properties": { "event": { "const": "session.stopped" } }, "required": ["event"] },
     "isCancelledEvent": { "type": "object", "properties": { "event": { "const": "cancelled" } }, "required": ["event"] },
     "error": {
-      "type": "object", "required": ["code", "message"],
+      "type": "object", "required": ["code", "message", "exit_code"],
       "properties": {
         "code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
-        "message": { "type": "string" }, "details": {}
+        "message": { "type": "string" }, "exit_code": { "enum": [2, 3, 4, 5, 6, 7, 8, 130] }, "details": {}
       },
       "additionalProperties": false
     }
