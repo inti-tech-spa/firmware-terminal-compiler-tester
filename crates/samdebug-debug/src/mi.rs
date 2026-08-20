@@ -157,7 +157,19 @@ fn parse_record(text: &str) -> SamdebugResult<MiRecord> {
         Vec::new()
     } else {
         let mut parser = ValueParser::new(&remainder[class_end + 1..]);
-        let results = parser.parse_result_sequence(None)?;
+        // GDB's documented download progress extension is emitted as
+        // `+download,{section=...,section-size=...,total-size=...}`. Unlike
+        // normal async output, its top-level tuple has no result variable.
+        // Accept only that exact status class and give the tuple a stable
+        // internal name so the rest of the engine remains strongly typed.
+        let results = if prefix == b'+' && class == "download" && parser.peek() == Some(b'{') {
+            vec![MiResult {
+                variable: "progress".into(),
+                value: parser.parse_value()?,
+            }]
+        } else {
+            parser.parse_result_sequence(None)?
+        };
         parser.require_end()?;
         results
     };
@@ -393,6 +405,28 @@ mod tests {
         };
         assert!(matches!(results[0].value, MiValue::List(_)));
         assert_eq!(results[1].value, MiValue::Const("a\tb\\c\"".into()));
+    }
+
+    #[test]
+    fn parses_gdb_download_progress_anonymous_tuple_only_for_download_status() {
+        let mut parser = MiStreamParser::new();
+        let records = parser
+            .push(b"+download,{section=\".text\",section-size=\"256\",total-size=\"4096\"}\n")
+            .expect("download progress");
+        let MiRecord::Status { class, results } = &records[0] else {
+            panic!("status record")
+        };
+        assert_eq!(class, "download");
+        assert_eq!(results[0].variable, "progress");
+        assert!(matches!(results[0].value, MiValue::Tuple(_)));
+
+        assert_eq!(
+            parser
+                .push(b"+other,{name=\"not-allowed\"}\n")
+                .unwrap_err()
+                .code(),
+            "MI_RECORD_INVALID"
+        );
     }
 
     #[test]
