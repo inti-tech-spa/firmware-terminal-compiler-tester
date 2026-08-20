@@ -173,6 +173,12 @@ impl OwnedDebugSession {
         let mut engine =
             SessionEngine::with_started_lifecycle(process, cancellation.clone(), generation);
         if let Err(error) = engine.connect_started(requested_serial, server.ports().gdb, &elf) {
+            let supervised = supervisor_failure
+                .lock()
+                .expect("supervisor failure mutex poisoned")
+                .clone();
+            let error =
+                resolve_startup_error(error, server.diagnosed_connection_failure(), supervised);
             if error.category() == ErrorCategory::Interrupted {
                 engine.cancel("session.start");
             } else {
@@ -319,16 +325,10 @@ impl OwnedDebugSession {
 
     fn alive(&mut self) -> SamdebugResult<()> {
         if let Err(cause) = self.server.check_alive() {
-            let error = SamdebugError::new(
-                ErrorCategory::Debugger,
-                cause.code(),
-                "debug server connection was lost; stop and start a new session to reconnect",
-            )
-            .with_details(serde_json::json!({"cause": cause}));
-            self.engine.fail_and_cleanup(&error);
+            self.engine.fail_and_cleanup(&cause);
             let _ = self.server.stop();
             self.join_supervisor();
-            return Err(error);
+            return Err(cause);
         }
         Ok(())
     }
@@ -574,6 +574,18 @@ fn emit_startup_failure(
     });
 }
 
+fn resolve_startup_error(
+    error: SamdebugError,
+    diagnosed: Option<SamdebugError>,
+    supervised: Option<SamdebugError>,
+) -> SamdebugError {
+    if error.category() == ErrorCategory::Interrupted {
+        diagnosed.or(supervised).unwrap_or(error)
+    } else {
+        error
+    }
+}
+
 fn next_generation() -> SamdebugResult<u64> {
     NEXT_GENERATION
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
@@ -730,6 +742,34 @@ mod tests {
             events.last(),
             Some(SessionEvent::SessionStopped { reason, .. }) if reason == "error"
         ));
+    }
+
+    #[test]
+    fn startup_transport_failure_overrides_apparent_cancellation_with_typed_cause() {
+        let interrupted = SamdebugError::new(
+            ErrorCategory::Interrupted,
+            "INTERRUPTED",
+            "startup interrupted",
+        );
+        let probe = SamdebugError::new(
+            ErrorCategory::Connection,
+            "PROBE_DISCONNECTED",
+            "probe disconnected",
+        );
+        let resolved = resolve_startup_error(interrupted, Some(probe), None);
+        assert_eq!(resolved.code(), "PROBE_DISCONNECTED");
+        assert_eq!(resolved.exit_code(), 5);
+
+        let interrupted = SamdebugError::new(
+            ErrorCategory::Interrupted,
+            "INTERRUPTED",
+            "startup interrupted",
+        );
+        let gdb = SamdebugError::new(ErrorCategory::Debugger, "GDB_EXITED", "GDB exited");
+        assert_eq!(
+            resolve_startup_error(interrupted, None, Some(gdb)).code(),
+            "GDB_EXITED"
+        );
     }
 
     #[test]
