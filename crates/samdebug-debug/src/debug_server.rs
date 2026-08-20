@@ -208,11 +208,7 @@ impl OpenOcdDebugServer {
         if let Some(status) = status {
             self.finish_readers();
             let log = self.log();
-            let code = if is_probe_disconnect(&log) {
-                "PROBE_DISCONNECTED"
-            } else {
-                "OPENOCD_EXITED"
-            };
+            let code = diagnosed_code(&log).unwrap_or("OPENOCD_EXITED");
             return Err(
                 connection_error(code, "OpenOCD debug server exited").with_details(
                     serde_json::json!({"exit_code": status.code(), "openocd_log": log}),
@@ -254,6 +250,21 @@ impl OpenOcdDebugServer {
     #[must_use]
     pub(crate) fn child_handle(&self) -> Arc<Mutex<Child>> {
         Arc::clone(&self.child)
+    }
+
+    pub(crate) fn diagnosed_connection_failure(&self) -> Option<SamdebugError> {
+        let log = self.log();
+        let code = diagnosed_code(&log)?;
+        let message = match code {
+            "PROBE_DISCONNECTED" => "Atmel-ICE transport disconnected during debugging",
+            "TARGET_UNREACHABLE" => "ATSAM4SD32C target connection was lost during debugging",
+            _ => "debug transport failed",
+        };
+        Some(
+            connection_error(code, message).with_details(serde_json::json!({
+                "openocd_log": log
+            })),
+        )
     }
 }
 
@@ -348,6 +359,16 @@ fn is_target_connection_loss(log: &str) -> bool {
         || lower.contains("unable to connect to target")
 }
 
+fn diagnosed_code(log: &str) -> Option<&'static str> {
+    if is_probe_disconnect(log) {
+        Some("PROBE_DISCONNECTED")
+    } else if is_target_connection_loss(log) {
+        Some("TARGET_UNREACHABLE")
+    } else {
+        None
+    }
+}
+
 fn tcl_quote(value: &str) -> String {
     let mut output = String::from('"');
     for character in value.chars() {
@@ -437,6 +458,14 @@ mod tests {
             "Error: couldn't bind tcl socket: Address already in use\nError: USB is disconnected"
         ));
         assert!(!is_probe_disconnect("Error: target examination failed"));
+        assert_eq!(
+            diagnosed_code("Error: USB is disconnected"),
+            Some("PROBE_DISCONNECTED")
+        );
+        assert_eq!(
+            diagnosed_code("Error: target examination failed"),
+            Some("TARGET_UNREACHABLE")
+        );
     }
 
     #[test]

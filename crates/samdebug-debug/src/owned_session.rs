@@ -66,6 +66,7 @@ impl OwnedDebugSession {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
     pub fn launch_with_event_sink(
         probes: &dyn ProbeProvider,
         openocd: &OpenOcdConfig,
@@ -110,7 +111,13 @@ impl OwnedDebugSession {
             event_sink,
             SessionEvent::ServerStarting { generation },
         );
-        let mut server = OpenOcdDebugServer::launch(openocd, requested_serial, cancellation)?;
+        let mut server = match OpenOcdDebugServer::launch(openocd, requested_serial, cancellation) {
+            Ok(server) => server,
+            Err(error) => {
+                emit_startup_failure(event_sink, generation, SessionState::ServerStarting, &error);
+                return Err(error);
+            }
+        };
         for event in [
             SessionEvent::State {
                 generation,
@@ -137,6 +144,7 @@ impl OwnedDebugSession {
         let process = match GdbMiProcess::launch_cancellable(gdb, cancellation) {
             Ok(process) => process,
             Err(error) => {
+                emit_startup_failure(event_sink, generation, SessionState::GdbStarting, &error);
                 let _ = server.stop();
                 return Err(error);
             }
@@ -153,6 +161,9 @@ impl OwnedDebugSession {
                 engine.cancel("session.start");
             } else {
                 engine.fail_and_cleanup(&error);
+            }
+            for event in engine.take_events() {
+                event_sink(&event);
             }
             let _ = server.stop();
             let _ = supervisor.join();
@@ -316,11 +327,15 @@ impl OwnedDebugSession {
                     self.engine.cancel("in_flight");
                     error
                 } else {
-                    let failure = SamdebugError::new(
-                        ErrorCategory::Debugger,
-                        "DEBUG_TRANSPORT_FAILED",
-                        "debugger supervision interrupted the operation after a child or transport failure",
-                    );
+                    let failure = self.server.diagnosed_connection_failure().unwrap_or_else(|| {
+                        self.server.check_alive().err().unwrap_or_else(|| {
+                            SamdebugError::new(
+                                ErrorCategory::Debugger,
+                                "DEBUG_TRANSPORT_FAILED",
+                                "debugger supervision interrupted the operation after a child or transport failure",
+                            )
+                        })
+                    });
                     self.engine.fail_and_cleanup(&failure);
                     failure
                 };
@@ -351,13 +366,18 @@ impl OwnedDebugSession {
         if self.user_cancel_requested.load(Ordering::SeqCst) {
             self.engine.cancel("external");
         } else {
-            let cause = self.server.check_alive().err().unwrap_or_else(|| {
-                SamdebugError::new(
-                    ErrorCategory::Debugger,
-                    "DEBUG_TRANSPORT_FAILED",
-                    "a supervised debugger child or transport failed",
-                )
-            });
+            let cause = self
+                .server
+                .diagnosed_connection_failure()
+                .unwrap_or_else(|| {
+                    self.server.check_alive().err().unwrap_or_else(|| {
+                        SamdebugError::new(
+                            ErrorCategory::Debugger,
+                            "DEBUG_TRANSPORT_FAILED",
+                            "a supervised debugger child or transport failed",
+                        )
+                    })
+                });
             self.engine.fail_and_cleanup(&cause);
         }
         let _ = self.server.stop();
@@ -475,6 +495,55 @@ fn record_event(
     pending.push(event);
 }
 
+fn emit_startup_failure(
+    sink: &mut dyn FnMut(&SessionEvent),
+    generation: u64,
+    current: SessionState,
+    error: &SamdebugError,
+) {
+    let terminal = if error.category() == ErrorCategory::Interrupted {
+        SessionState::Cancelling
+    } else {
+        SessionState::Failed
+    };
+    sink(&SessionEvent::State {
+        generation,
+        previous: current,
+        current: terminal,
+    });
+    if terminal == SessionState::Cancelling {
+        sink(&SessionEvent::Cancelled {
+            generation,
+            operation: "session.start".into(),
+        });
+    } else {
+        sink(&SessionEvent::SessionError {
+            generation,
+            code: error.code().to_owned(),
+            message: error.to_string(),
+            recoverable: true,
+        });
+    }
+    sink(&SessionEvent::State {
+        generation,
+        previous: terminal,
+        current: SessionState::Disconnecting,
+    });
+    sink(&SessionEvent::State {
+        generation,
+        previous: SessionState::Disconnecting,
+        current: SessionState::Idle,
+    });
+    sink(&SessionEvent::SessionStopped {
+        generation,
+        reason: if terminal == SessionState::Cancelling {
+            "cancelled".into()
+        } else {
+            "error".into()
+        },
+    });
+}
+
 fn next_generation() -> SamdebugResult<u64> {
     NEXT_GENERATION
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
@@ -499,6 +568,7 @@ fn is_fatal_debug_error(error: &SamdebugError) -> bool {
             | "GDB_STOP_TIMEOUT"
             | "GDB_TARGET_DISCONNECTED"
             | "MI_RECORD_INVALID"
+            | "MI_TOKEN_INVALID"
             | "MI_RECORD_TOO_LARGE"
             | "MI_RECORD_TRUNCATED"
             | "MI_UTF8_INVALID"
@@ -540,24 +610,28 @@ fn child_exited(child: &Arc<Mutex<Child>>) -> bool {
 
 fn terminate_and_reap(child: &Arc<Mutex<Child>>) {
     let mut child = child.lock().expect("supervised child mutex poisoned");
-    if child.try_wait().is_ok_and(|status| status.is_some()) {
-        return;
-    }
     let pid = child.id();
     signal_group(pid, "-TERM");
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
-        if child.try_wait().is_ok_and(|status| status.is_some()) {
-            return;
-        }
+        let leader_exited = child.try_wait().is_ok_and(|status| status.is_some());
         if Instant::now() >= deadline {
+            break;
+        }
+        if leader_exited {
+            // The process-group leader may exit before descendants. Keep the
+            // group addressable briefly, then force any remaining descendants
+            // down below instead of returning early.
+            thread::sleep(Duration::from_millis(50));
             break;
         }
         thread::sleep(Duration::from_millis(10));
     }
     signal_group(pid, "-KILL");
-    let _ = child.kill();
-    let _ = child.wait();
+    if !child.try_wait().is_ok_and(|status| status.is_some()) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 #[cfg(unix)]
@@ -585,6 +659,35 @@ mod tests {
     }
 
     #[test]
+    fn startup_failure_sink_receives_terminal_cleanup_lifecycle() {
+        let mut events = Vec::new();
+        emit_startup_failure(
+            &mut |event| events.push(event.clone()),
+            41,
+            SessionState::ServerStarting,
+            &SamdebugError::new(ErrorCategory::Connection, "OPENOCD_START_FAILED", "failed"),
+        );
+        assert!(matches!(
+            events.first(),
+            Some(SessionEvent::State {
+                current: SessionState::Failed,
+                ..
+            })
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::State {
+                current: SessionState::Disconnecting,
+                ..
+            }
+        )));
+        assert!(matches!(
+            events.last(),
+            Some(SessionEvent::SessionStopped { reason, .. }) if reason == "error"
+        ));
+    }
+
+    #[test]
     #[cfg(unix)]
     fn supervisor_reaps_both_groups_on_cancel_or_peer_exit() {
         let cancellation = CancellationToken::new();
@@ -596,6 +699,29 @@ mod tests {
         supervisor.join().expect("supervisor");
         assert!(child_exited(&gdb));
         assert!(child_exited(&openocd));
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let descendant_file = temp.path().join("descendant.pid");
+        let cancellation = CancellationToken::new();
+        let gdb = spawn_group(&format!(
+            "/bin/sleep 30 & child=$!; echo $child > {}; exit 0",
+            descendant_file.display()
+        ));
+        let openocd = spawn_group("/bin/sleep 30");
+        let supervisor =
+            spawn_supervisor(Arc::clone(&gdb), Arc::clone(&openocd), cancellation.clone());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !descendant_file.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let descendant: u32 = std::fs::read_to_string(&descendant_file)
+            .expect("descendant pid")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+        supervisor.join().expect("supervisor");
+        assert!(cancellation.is_cancelled());
+        assert!(!pid_is_alive(descendant), "descendant must be terminated");
 
         let cancellation = CancellationToken::new();
         let gdb = spawn_group("exit 0");
@@ -620,5 +746,14 @@ mod tests {
             .stderr(Stdio::null())
             .process_group(0);
         Arc::new(Mutex::new(command.spawn().expect("spawn group")))
+    }
+
+    #[cfg(unix)]
+    fn pid_is_alive(pid: u32) -> bool {
+        Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 }

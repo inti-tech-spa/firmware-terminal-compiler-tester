@@ -359,17 +359,33 @@ impl<T: DebuggerTransport> SessionEngine<T> {
             &[SessionState::Halted, SessionState::Running],
             "target.reset",
         )?;
-        self.reset_and_confirm_halted()?;
+        self.run_done(
+            &format!(
+                "-interpreter-exec console {}",
+                mi_quote("monitor reset halt")
+            ),
+            false,
+        )?;
         if self.state == SessionState::Running {
             self.transition(SessionState::Halted);
         }
+        let output = self.run_done("-stack-info-frame", false)?;
+        let frame = result(&output.results, "frame")
+            .and_then(as_tuple)
+            .and_then(parse_frame)
+            .ok_or_else(|| {
+                debug_error(
+                    "TARGET_HALT_UNCONFIRMED",
+                    "GDB did not return a current frame after reset halt",
+                )
+            })?;
         self.events.push(SessionEvent::Reset {
             generation: self.generation,
         });
         self.events.push(SessionEvent::Stopped {
             generation: self.generation,
             reason: "reset".into(),
-            frame: None,
+            frame: Some(frame),
         });
         Ok(())
     }
@@ -642,13 +658,25 @@ impl<T: DebuggerTransport> SessionEngine<T> {
     ) -> SamdebugResult<Option<StackFrame>> {
         let (reason, mut frame) =
             stopped_details(records).unwrap_or((fallback_reason.into(), None));
+        if self.state != SessionState::Halted {
+            self.transition(SessionState::Halted);
+        }
         if frame.is_none() {
-            let output = self.run_done("-stack-info-frame", false)?;
+            let output = match self.run_done("-stack-info-frame", false) {
+                Ok(output) => output,
+                Err(error) => {
+                    self.events.push(SessionEvent::Stopped {
+                        generation: self.generation,
+                        reason,
+                        frame: None,
+                    });
+                    return Err(error);
+                }
+            };
             frame = result(&output.results, "frame")
                 .and_then(as_tuple)
                 .and_then(parse_frame);
         }
-        self.transition(SessionState::Halted);
         self.events.push(SessionEvent::Stopped {
             generation: self.generation,
             reason,
@@ -1137,6 +1165,72 @@ mod tests {
             engine.transport.commands.last().map(String::as_str),
             Some("-stack-info-frame")
         );
+    }
+
+    #[test]
+    fn stop_and_reset_errors_preserve_truthful_halted_state() {
+        let stop_without_frame = MiCommandOutput {
+            result_class: "done".into(),
+            results: Vec::new(),
+            records: vec![MiRecord::Exec {
+                class: "stopped".into(),
+                results: vec![MiResult {
+                    variable: "reason".into(),
+                    value: MiValue::Const("signal-received".into()),
+                }],
+            }],
+            stopped_after_command: false,
+        };
+        let frame_error = MiCommandOutput {
+            result_class: "error".into(),
+            results: vec![MiResult {
+                variable: "msg".into(),
+                value: MiValue::Const("frame unavailable".into()),
+            }],
+            records: Vec::new(),
+            stopped_after_command: false,
+        };
+        let mut stopped = SessionEngine::new(started_transport(vec![
+            MiCommandOutput {
+                result_class: "running".into(),
+                results: Vec::new(),
+                records: Vec::new(),
+                stopped_after_command: false,
+            },
+            stop_without_frame,
+            frame_error,
+        ]));
+        start(&mut stopped);
+        stopped.continue_target().expect("continue");
+        assert_eq!(
+            stopped.wait_until_stopped().unwrap_err().code(),
+            "GDB_COMMAND_FAILED"
+        );
+        assert_eq!(stopped.state(), SessionState::Halted);
+        assert!(
+            stopped
+                .take_events()
+                .iter()
+                .any(|event| matches!(event, SessionEvent::Stopped { frame: None, .. }))
+        );
+
+        let mut reset = SessionEngine::new(started_transport(vec![
+            MiCommandOutput {
+                result_class: "running".into(),
+                results: Vec::new(),
+                records: Vec::new(),
+                stopped_after_command: false,
+            },
+            done(),
+            done(),
+        ]));
+        start(&mut reset);
+        reset.continue_target().expect("continue");
+        assert_eq!(
+            reset.reset_halt().unwrap_err().code(),
+            "TARGET_HALT_UNCONFIRMED"
+        );
+        assert_eq!(reset.state(), SessionState::Halted);
     }
 
     #[test]

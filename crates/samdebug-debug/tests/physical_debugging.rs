@@ -1,8 +1,8 @@
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, thread, time::Duration};
 
-use samdebug_core::CancellationToken;
+use samdebug_core::{CancellationToken, ErrorCategory};
 use samdebug_debug::{
-    FirmwareArtifact, GdbMiConfig, OpenOcdConfig, OwnedDebugSession, SessionState,
+    FirmwareArtifact, GdbMiConfig, OpenOcdConfig, OwnedDebugSession, SessionEvent, SessionState,
 };
 use samdebug_tools::MacUsbProbeProvider;
 
@@ -121,5 +121,62 @@ fn physical_gdb_mi_break_step_inspect_load_reconnect_and_cleanup() {
         &CancellationToken::new(),
     )
     .expect("explicit reconnect");
+    reconnected.stop().expect("stop reconnected session");
+}
+
+#[test]
+#[ignore = "requires an externally powered ATSAM4SD32C, Atmel-ICE, audited tools, ELF, and explicit firmware-load confirmation"]
+fn physical_gdb_mi_cancels_firmware_load_reaps_and_releases_probe() {
+    let (serial, firmware, openocd, gdb) = configuration();
+    assert_eq!(
+        required("SAMDEBUG_PHYSICAL_DEBUG_CONFIRM"),
+        format!("firmware.load:{serial}")
+    );
+    let mut session = OwnedDebugSession::launch(
+        &MacUsbProbeProvider,
+        &openocd,
+        &gdb,
+        &serial,
+        &firmware,
+        &CancellationToken::new(),
+    )
+    .expect("launch debug session");
+    let controller = session.cancellation_controller();
+    let canceller = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(1));
+        controller.cancel();
+    });
+    let error = session
+        .load_firmware(&format!("firmware.load:{serial}"))
+        .expect_err("firmware load must be cancelled");
+    canceller.join().expect("canceller");
+    assert_eq!(error.category(), ErrorCategory::Interrupted);
+    assert_eq!(error.exit_code(), 130);
+    assert_eq!(session.state(), SessionState::Idle);
+    let events = session.take_events();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::State {
+            current: SessionState::Cancelling,
+            ..
+        }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::State {
+            current: SessionState::Disconnecting,
+            ..
+        }
+    )));
+
+    let mut reconnected = OwnedDebugSession::launch(
+        &MacUsbProbeProvider,
+        &openocd,
+        &gdb,
+        &serial,
+        &firmware,
+        &CancellationToken::new(),
+    )
+    .expect("probe released after cancellation");
     reconnected.stop().expect("stop reconnected session");
 }
