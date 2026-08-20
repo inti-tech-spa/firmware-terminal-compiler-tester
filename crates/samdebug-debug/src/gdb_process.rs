@@ -232,7 +232,7 @@ impl DebuggerTransport for GdbMiProcess {
             {
                 result = Some((class.clone(), results.clone()));
             }
-            if result.is_some()
+            if (wait_for_stop || result.is_some())
                 && matches!(&record, MiRecord::Exec { class, .. } if class == "stopped")
             {
                 stopped = true;
@@ -486,7 +486,7 @@ mod tests {
         let script = temp.path().join("fake-gdb");
         fs::write(
             &script,
-            "#!/bin/sh\n[ \"$1\" = '--interpreter=mi2' ] || exit 90\n[ \"$2\" = '--nx' ] || exit 91\n[ \"$3\" = '--quiet' ] || exit 92\nprintf '(gdb)\\n'\nwhile IFS= read -r line; do\n token=${line%%-*}\n case \"$line\" in\n *-gdb-exit) printf '%s^exit\\n' \"$token\"; exit 0 ;;\n *) printf '%s' \"$token\"; printf '^do'; printf 'ne\\n*stopped,reason=\"end-stepping-range\"\\n' ;;\n esac\ndone\n",
+            "#!/bin/sh\n[ \"$1\" = '--interpreter=mi2' ] || exit 90\n[ \"$2\" = '--nx' ] || exit 91\n[ \"$3\" = '--quiet' ] || exit 92\nprintf '(gdb)\\n'\nwhile IFS= read -r line; do\n token=${line%%-*}\n case \"$line\" in\n *-gdb-exit) printf '%s^exit\\n' \"$token\"; exit 0 ;;\n *) printf '*stopped,reason=\"end-stepping-range\"\\n'; printf '%s' \"$token\"; printf '^do'; printf 'ne\\n' ;;\n esac\ndone\n",
         )
         .expect("script");
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("executable");
