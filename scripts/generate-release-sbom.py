@@ -8,11 +8,110 @@ import json
 import os
 import subprocess
 import uuid
+from typing import Optional
+
+
+EXTRACTED_LICENSES = {
+    "LicenseRef-Arm-GNU-Manifest": {
+        "name": "Arm GNU Toolchain build manifest",
+        "extractedText": (
+            "Arm GNU Toolchain 15.2.Rel1 build-manifest notice. The packaged "
+            "15.2.rel1-darwin-arm64-arm-none-eabi-manifest.txt records the "
+            "configure options and component revisions used to produce the "
+            "redistributed binary toolchain. It is distributed verbatim with "
+            "the managed tool bundle and is not a substitute for the component "
+            "license texts in that bundle."
+        ),
+    },
+    "LicenseRef-Arm-GNU-Release-Notices": {
+        "name": "Arm GNU Toolchain release notice",
+        "extractedText": (
+            "Arm GNU Toolchain 15.2.rel1\nGCC Version: 15.2\n\n"
+            "For updated content, see the release note for the relevant release, on:\n"
+            "https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads"
+        ),
+    },
+    "LicenseRef-JimTcl-Tcl": {
+        "name": "Jim Tcl license terms",
+        "extractedText": (
+            "This software is copyrighted by the Regents of the University of\n"
+            "California, Sun Microsystems, Inc., Scriptics Corporation, ActiveState\n"
+            "Corporation and other parties.  The following terms apply to all files\n"
+            "associated with the software unless explicitly disclaimed in\n"
+            "individual files.\n\n"
+            "The authors hereby grant permission to use, copy, modify, distribute,\n"
+            "and license this software and its documentation for any purpose, provided\n"
+            "that existing copyright notices are retained in all copies and that this\n"
+            "notice is included verbatim in any distributions. No written agreement,\n"
+            "license, or royalty fee is required for any of the authorized uses.\n"
+            "Modifications to this software may be copyrighted by their authors\n"
+            "and need not follow the licensing terms described here, provided that\n"
+            "the new terms are clearly indicated on the first page of each file where\n"
+            "they apply.\n\n"
+            "IN NO EVENT SHALL THE AUTHORS OR DISTRIBUTORS BE LIABLE TO ANY PARTY\n"
+            "FOR DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES\n"
+            "ARISING OUT OF THE USE OF THIS SOFTWARE, ITS DOCUMENTATION, OR ANY\n"
+            "DERIVATIVES THEREOF, EVEN IF THE AUTHORS HAVE BEEN ADVISED OF THE\n"
+            "POSSIBILITY OF SUCH DAMAGE.\n\n"
+            "THE AUTHORS AND DISTRIBUTORS SPECIFICALLY DISCLAIM ANY WARRANTIES,\n"
+            "INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY,\n"
+            "FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.  THIS SOFTWARE\n"
+            "IS PROVIDED ON AN \"AS IS\" BASIS, AND THE AUTHORS AND DISTRIBUTORS HAVE\n"
+            "NO OBLIGATION TO PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR\n"
+            "MODIFICATIONS.\n\n"
+            "GOVERNMENT USE: If you are acquiring this software on behalf of the\n"
+            "U.S. government, the Government shall have only \"Restricted Rights\"\n"
+            "in the software and related documentation as defined in the Federal\n"
+            "Acquisition Regulations (FARs) in Clause 52.227.19 (c) (2).  If you\n"
+            "are acquiring the software on behalf of the Department of Defense, the\n"
+            "software shall be classified as \"Commercial Computer Software\" and the\n"
+            "Government shall have only \"Restricted Rights\" as defined in Clause\n"
+            "252.227-7013 (c) (1) of DFARs.  Notwithstanding the foregoing, the\n"
+            "authors grant the U.S. Government and others acting in its behalf\n"
+            "permission to use and distribute the software in accordance with the\n"
+            "terms specified in this license."
+        ),
+    },
+}
 
 
 def spdx_id(package_id: str) -> str:
     digest = hashlib.sha256(package_id.encode()).hexdigest()[:24]
     return f"SPDXRef-Package-{digest}"
+
+
+def normalize_license_expression(expression: Optional[str]) -> str:
+    """Normalize Cargo's legacy slash-separated alternatives to SPDX syntax."""
+    if not expression:
+        return "NOASSERTION"
+    if "/" not in expression:
+        return expression
+    return " OR ".join(part.strip() for part in expression.split("/") if part.strip())
+
+
+def reachable_package_ids(root_id: str, nodes: list[dict]) -> set[str]:
+    dependencies = {node["id"]: node.get("dependencies", []) for node in nodes}
+    reachable = set()
+    pending = [root_id]
+    while pending:
+        package_id = pending.pop()
+        if package_id in reachable:
+            continue
+        reachable.add(package_id)
+        pending.extend(dependencies.get(package_id, []))
+    return reachable
+
+
+def cargo_download_location(package: dict) -> str:
+    source = package.get("source") or ""
+    if source.startswith("registry+"):
+        return (
+            f"https://crates.io/api/v1/crates/{package['name']}/"
+            f"{package['version']}/download"
+        )
+    if source.startswith("git+"):
+        return source.removeprefix("git+")
+    return package.get("repository") or source or "NOASSERTION"
 
 
 def main() -> None:
@@ -24,7 +123,16 @@ def main() -> None:
     args = parser.parse_args()
     metadata = json.loads(
         subprocess.check_output(
-            [args.cargo, "metadata", "--locked", "--format-version", "1"], text=True
+            [
+                args.cargo,
+                "metadata",
+                "--locked",
+                "--format-version",
+                "1",
+                "--filter-platform",
+                "aarch64-apple-darwin",
+            ],
+            text=True,
         )
     )
     packages_by_id = {package["id"]: package for package in metadata["packages"]}
@@ -34,6 +142,9 @@ def main() -> None:
         if package["name"] == "samdebug" and package["source"] is None
     )
     root = packages_by_id[root_id]
+    resolve = metadata.get("resolve") or {}
+    resolve_nodes = resolve.get("nodes", [])
+    reachable = reachable_package_ids(root_id, resolve_nodes)
     with open(args.binary, "rb") as binary:
         binary_hash = hashlib.sha256(binary.read()).hexdigest()
     epoch = int(os.environ.get("SOURCE_DATE_EPOCH", "0"))
@@ -53,12 +164,21 @@ def main() -> None:
         },
         "packages": [],
         "relationships": [],
+        "hasExtractedLicensingInfos": [
+            {"licenseId": license_id, **EXTRACTED_LICENSES[license_id]}
+            for license_id in sorted(EXTRACTED_LICENSES)
+        ],
     }
     for package_id, package in sorted(
-        packages_by_id.items(), key=lambda item: (item[1]["name"], item[1]["version"], item[0])
+        (
+            (package_id, packages_by_id[package_id])
+            for package_id in reachable
+            if package_id in packages_by_id
+        ),
+        key=lambda item: (item[1]["name"], item[1]["version"], item[0]),
     ):
-        license_value = package.get("license") or "NOASSERTION"
-        download = package.get("source") or package.get("repository") or "NOASSERTION"
+        license_value = normalize_license_expression(package.get("license"))
+        download = cargo_download_location(package)
         document["packages"].append(
             {
                 "name": package["name"],
@@ -80,7 +200,7 @@ def main() -> None:
             "filesAnalyzed": False,
             "checksums": [{"algorithm": "SHA256", "checksumValue": binary_hash}],
             "licenseConcluded": "NOASSERTION",
-            "licenseDeclared": root.get("license") or "NOASSERTION",
+            "licenseDeclared": normalize_license_expression(root.get("license")),
             "copyrightText": "NOASSERTION",
         }
     )
@@ -98,9 +218,12 @@ def main() -> None:
             "relatedSpdxElement": spdx_id(root_id),
         }
     )
-    resolve = metadata.get("resolve") or {}
-    for node in sorted(resolve.get("nodes", []), key=lambda value: value["id"]):
+    for node in sorted(resolve_nodes, key=lambda value: value["id"]):
+        if node["id"] not in reachable:
+            continue
         for dependency in sorted(node.get("dependencies", [])):
+            if dependency not in reachable:
+                continue
             document["relationships"].append(
                 {
                     "spdxElementId": spdx_id(node["id"]),
@@ -114,8 +237,12 @@ def main() -> None:
         artifact_identity = f"managed:{artifact['name']}:{artifact['version']}"
         artifact_spdx = spdx_id(artifact_identity)
         source_spdx = spdx_id(f"source:{artifact_identity}")
+        expressions = sorted(
+            {license_entry["spdx"] for license_entry in artifact["licenses"]}
+        )
         declared = " AND ".join(
-            sorted({license_entry["spdx"] for license_entry in artifact["licenses"]})
+            f"({expression})" if " OR " in expression else expression
+            for expression in expressions
         )
         document["packages"].append(
             {

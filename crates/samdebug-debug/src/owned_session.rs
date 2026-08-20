@@ -65,15 +65,21 @@ impl OwnedDebugSession {
         firmware: &FirmwareArtifact,
         cancellation: &CancellationToken,
     ) -> SamdebugResult<Self> {
-        Self::launch_with_event_sink(
+        let mut startup_events = Vec::new();
+        let mut session = Self::launch_with_event_sink(
             probes,
             openocd,
             gdb,
             requested_serial,
             firmware,
             cancellation,
-            &mut |_| {},
-        )
+            &mut |event| startup_events.push(event.clone()),
+        )?;
+        // Callers that do not consume the live startup sink receive the same
+        // lifecycle once through take_events(). Sink-aware callers already
+        // published these events and must not receive them a second time.
+        session.pending_events = startup_events;
+        Ok(session)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -90,38 +96,21 @@ impl OwnedDebugSession {
         validate_selected_probe(probes, requested_serial)?;
         let elf = validate_debug_elf(firmware)?;
         let generation = next_generation()?;
-        let mut pending_events = Vec::new();
-        record_event(
-            &mut pending_events,
-            event_sink,
-            SessionEvent::ProbeSelected {
-                generation,
-                probe_serial: requested_serial.to_owned(),
-            },
-        );
-        record_event(
-            &mut pending_events,
-            event_sink,
-            SessionEvent::State {
-                generation,
-                previous: SessionState::Idle,
-                current: SessionState::ProbeSelected,
-            },
-        );
-        record_event(
-            &mut pending_events,
-            event_sink,
-            SessionEvent::State {
-                generation,
-                previous: SessionState::ProbeSelected,
-                current: SessionState::ServerStarting,
-            },
-        );
-        record_event(
-            &mut pending_events,
-            event_sink,
-            SessionEvent::ServerStarting { generation },
-        );
+        event_sink(&SessionEvent::ProbeSelected {
+            generation,
+            probe_serial: requested_serial.to_owned(),
+        });
+        event_sink(&SessionEvent::State {
+            generation,
+            previous: SessionState::Idle,
+            current: SessionState::ProbeSelected,
+        });
+        event_sink(&SessionEvent::State {
+            generation,
+            previous: SessionState::ProbeSelected,
+            current: SessionState::ServerStarting,
+        });
+        event_sink(&SessionEvent::ServerStarting { generation });
         let mut server = match OpenOcdDebugServer::launch(openocd, requested_serial, cancellation) {
             Ok(server) => server,
             Err(error) => {
@@ -146,7 +135,7 @@ impl OwnedDebugSession {
             },
             SessionEvent::GdbStarting { generation },
         ] {
-            record_event(&mut pending_events, event_sink, event);
+            event_sink(&event);
         }
         if cancellation.is_cancelled() {
             let error = interrupted();
@@ -195,7 +184,7 @@ impl OwnedDebugSession {
             server,
             engine,
             openocd_log_offset: 0,
-            pending_events,
+            pending_events: Vec::new(),
             cancellation: cancellation.clone(),
             supervisor: Some(supervisor),
             user_cancel_requested: Arc::new(AtomicBool::new(false)),
@@ -522,15 +511,6 @@ fn interrupted() -> SamdebugError {
         "INTERRUPTED",
         "debug session startup interrupted",
     )
-}
-
-fn record_event(
-    pending: &mut Vec<SessionEvent>,
-    sink: &mut dyn FnMut(&SessionEvent),
-    event: SessionEvent,
-) {
-    sink(&event);
-    pending.push(event);
 }
 
 fn emit_startup_failure(

@@ -493,8 +493,44 @@ fn physical_agent_stdio_debug_workflow_and_cleanup() {
     let hello = read_agent_message(&mut output);
     assert_eq!(hello["event"], "hello");
 
+    let start = serde_json::json!({"schema_version":1,"kind":"request","id":1,"operation":"session.start","payload":{"probe_serial":serial}});
+    writeln!(input, "{start}").expect("write agent start request");
+    let (response, startup_events) = read_agent_response_with_events(&mut output, &start["id"]);
+    assert_eq!(response["ok"], true, "{response}");
+    for event in &startup_events {
+        assert_eq!(event["schema_version"], 1);
+        assert_eq!(event["kind"], "event");
+        assert!(event["event"].is_string());
+        assert!(event["payload"].is_object());
+    }
+    for required in [
+        "probe.selected",
+        "server.starting",
+        "server.ready",
+        "gdb.starting",
+        "stopped",
+    ] {
+        assert_eq!(
+            startup_events
+                .iter()
+                .filter(|event| event["event"] == required)
+                .count(),
+            1,
+            "startup event {required} must be published exactly once: {startup_events:?}"
+        );
+    }
+    let halted = startup_events
+        .iter()
+        .position(|event| event["event"] == "state" && event["payload"]["current"] == "halted");
+    let stopped = startup_events
+        .iter()
+        .position(|event| event["event"] == "stopped");
+    assert!(
+        halted.is_some_and(|index| stopped.is_some_and(|stopped| index < stopped)),
+        "halted/stopped lifecycle must precede the start response"
+    );
+
     let requests = [
-        serde_json::json!({"schema_version":1,"kind":"request","id":1,"operation":"session.start","payload":{"probe_serial":serial}}),
         serde_json::json!({"schema_version":1,"kind":"request","id":2,"operation":"breakpoint.insert","payload":{"location":"main","temporary":true}}),
         serde_json::json!({"schema_version":1,"kind":"request","id":3,"operation":"target.continue","payload":{}}),
     ];
@@ -538,10 +574,21 @@ fn read_agent_message(reader: &mut impl BufRead) -> serde_json::Value {
 }
 
 fn read_agent_response(reader: &mut impl BufRead, id: &serde_json::Value) -> serde_json::Value {
+    read_agent_response_with_events(reader, id).0
+}
+
+fn read_agent_response_with_events(
+    reader: &mut impl BufRead,
+    id: &serde_json::Value,
+) -> (serde_json::Value, Vec<serde_json::Value>) {
+    let mut events = Vec::new();
     loop {
         let message = read_agent_message(reader);
         if message["kind"] == "response" && &message["id"] == id {
-            return message;
+            return (message, events);
+        }
+        if message["kind"] == "event" {
+            events.push(message);
         }
     }
 }

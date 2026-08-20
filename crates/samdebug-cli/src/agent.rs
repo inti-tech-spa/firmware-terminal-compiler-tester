@@ -382,7 +382,7 @@ fn execute(
             let session_cancellation = CancellationToken::new();
             let startup_forwarder = TokenForwarder::start(cancellation, &session_cancellation);
             let mut output_error = None;
-            let owned = {
+            let mut owned = {
                 let mut sink = |event: &SessionEvent| {
                     if output_error.is_none()
                         && let Err(error) = emit_session_event(writer, event)
@@ -405,6 +405,10 @@ fn execute(
                 drop(owned);
                 return Err(error);
             }
+            // launch_with_event_sink already published the probe/server/GDB
+            // prefix. Publish the engine's connected/halted/stopped suffix now,
+            // before the successful start response, and never replay the prefix.
+            emit_session_events(writer, owned.take_events())?;
             let result = json!({
                 "generation": owned.generation(),
                 "state": "halted",

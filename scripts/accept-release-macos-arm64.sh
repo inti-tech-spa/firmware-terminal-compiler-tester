@@ -9,6 +9,7 @@ test -x "$binary"
 file "$binary" | grep -q 'Mach-O 64-bit executable arm64'
 (cd "$release_dir" && shasum -a 256 -c samdebug.sha256)
 python3 -m json.tool "$release_dir/samdebug.spdx.json" >/dev/null
+python3 "$project_root/scripts/validate-release-sbom.py" "$release_dir/samdebug.spdx.json"
 grep -q '"name": "arm-gnu-toolchain"' "$release_dir/samdebug.spdx.json"
 grep -q '"name": "openocd"' "$release_dir/samdebug.spdx.json"
 grep -q 'corresponding-source' "$release_dir/samdebug.spdx.json"

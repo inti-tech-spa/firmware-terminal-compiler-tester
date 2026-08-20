@@ -309,11 +309,9 @@ pub fn run(
     if let Err(error) = enable_raw_mode() {
         return Err(terminal_error(error));
     }
-    if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
-        let _ = disable_raw_mode();
-        return Err(terminal_error(error));
-    }
-    let cleanup = TerminalCleanup::new(CrosstermRestorer);
+    let cleanup = complete_terminal_setup(CrosstermRestorer, || {
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+    })?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(terminal_error)?;
     terminal.clear().map_err(terminal_error)?;
@@ -426,6 +424,19 @@ impl<R: TerminalRestorer> TerminalCleanup<R> {
     const fn new(restorer: R) -> Self {
         Self { restorer }
     }
+}
+
+fn complete_terminal_setup<R, F>(restorer: R, setup: F) -> SamdebugResult<TerminalCleanup<R>>
+where
+    R: TerminalRestorer,
+    F: FnOnce() -> io::Result<()>,
+{
+    // The guard must exist before entering the alternate screen. If a compound
+    // crossterm setup fails after applying only some commands, dropping it
+    // restores raw mode, mouse capture, and the original screen.
+    let cleanup = TerminalCleanup::new(restorer);
+    setup().map_err(terminal_error)?;
+    Ok(cleanup)
 }
 
 impl<R: TerminalRestorer> Drop for TerminalCleanup<R> {
@@ -875,6 +886,17 @@ mod tests {
         });
         assert!(result.is_err());
         assert_eq!(panicking.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn terminal_cleanup_runs_when_compound_setup_partially_fails() {
+        let restores = Arc::new(AtomicUsize::new(0));
+        let result = complete_terminal_setup(
+            CountingRestorer(Arc::clone(&restores)),
+            || -> io::Result<()> { Err(io::Error::other("mouse capture setup failed")) },
+        );
+        assert!(result.is_err());
+        assert_eq!(restores.load(Ordering::SeqCst), 1);
     }
 
     #[test]
