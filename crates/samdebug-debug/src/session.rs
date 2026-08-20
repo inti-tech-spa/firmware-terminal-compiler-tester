@@ -228,7 +228,7 @@ impl<T: DebuggerTransport> SessionEngine<T> {
                 .iter()
                 .any(|record| matches!(record, MiRecord::Exec { class, .. } if class == "stopped"))
         {
-            self.finish_stop(&records, "unknown");
+            self.finish_stop(&records, "unknown")?;
         }
         Ok(())
     }
@@ -311,7 +311,7 @@ impl<T: DebuggerTransport> SessionEngine<T> {
             generation: self.generation,
         });
         if output.stopped_after_command {
-            self.finish_stop(&output.records, "unknown");
+            self.finish_stop(&output.records, "unknown")?;
         }
         Ok(())
     }
@@ -319,7 +319,7 @@ impl<T: DebuggerTransport> SessionEngine<T> {
     pub fn halt(&mut self) -> SamdebugResult<Option<StackFrame>> {
         self.require(&[SessionState::Running], "target.halt")?;
         let output = self.run_done("-exec-interrupt --all", true)?;
-        Ok(self.finish_stop(&output.records, "halt"))
+        self.finish_stop(&output.records, "halt")
     }
 
     pub fn wait_until_stopped(&mut self) -> SamdebugResult<Option<StackFrame>> {
@@ -328,7 +328,7 @@ impl<T: DebuggerTransport> SessionEngine<T> {
             .transport
             .wait_for_stop(COMMAND_TIMEOUT, &self.cancellation)?;
         self.capture_records(&records);
-        Ok(self.finish_stop(&records, "unknown"))
+        self.finish_stop(&records, "unknown")
     }
 
     pub fn step(&mut self) -> SamdebugResult<Option<StackFrame>> {
@@ -351,7 +351,7 @@ impl<T: DebuggerTransport> SessionEngine<T> {
         } else {
             self.run_done("-exec-interrupt --all", true)?
         };
-        Ok(self.finish_stop(&stopped.records, "step"))
+        self.finish_stop(&stopped.records, "step")
     }
 
     pub fn reset_halt(&mut self) -> SamdebugResult<()> {
@@ -635,15 +635,26 @@ impl<T: DebuggerTransport> SessionEngine<T> {
         });
     }
 
-    fn finish_stop(&mut self, records: &[MiRecord], fallback_reason: &str) -> Option<StackFrame> {
-        let (reason, frame) = stopped_details(records).unwrap_or((fallback_reason.into(), None));
+    fn finish_stop(
+        &mut self,
+        records: &[MiRecord],
+        fallback_reason: &str,
+    ) -> SamdebugResult<Option<StackFrame>> {
+        let (reason, mut frame) =
+            stopped_details(records).unwrap_or((fallback_reason.into(), None));
+        if frame.is_none() {
+            let output = self.run_done("-stack-info-frame", false)?;
+            frame = result(&output.results, "frame")
+                .and_then(as_tuple)
+                .and_then(parse_frame);
+        }
         self.transition(SessionState::Halted);
         self.events.push(SessionEvent::Stopped {
             generation: self.generation,
             reason,
             frame: frame.clone(),
         });
-        frame
+        Ok(frame)
     }
 
     fn run_done(&mut self, command: &str, wait_for_stop: bool) -> SamdebugResult<MiCommandOutput> {
@@ -713,7 +724,7 @@ impl<T: DebuggerTransport> SessionEngine<T> {
                 "-interpreter-exec console {}",
                 mi_quote("monitor reset halt")
             ),
-            true,
+            false,
         )?;
         let output = self.run_done("-stack-info-frame", false)?;
         if result(&output.results, "frame")
@@ -913,7 +924,6 @@ mod tests {
     #[derive(Debug)]
     struct FakeTransport {
         commands: Vec<String>,
-        stop_wait_commands: Vec<String>,
         outputs: VecDeque<MiCommandOutput>,
         pending_records: Vec<MiRecord>,
         shutdowns: usize,
@@ -923,7 +933,6 @@ mod tests {
         fn scripted(outputs: Vec<MiCommandOutput>) -> Self {
             Self {
                 commands: Vec::new(),
-                stop_wait_commands: Vec::new(),
                 outputs: outputs.into(),
                 pending_records: Vec::new(),
                 shutdowns: 0,
@@ -935,7 +944,7 @@ mod tests {
         fn command(
             &mut self,
             command: &str,
-            wait_for_stop: bool,
+            _wait_for_stop: bool,
             _timeout: Duration,
             cancellation: &CancellationToken,
         ) -> SamdebugResult<MiCommandOutput> {
@@ -947,9 +956,6 @@ mod tests {
                 ));
             }
             self.commands.push(command.to_owned());
-            if wait_for_stop {
-                self.stop_wait_commands.push(command.to_owned());
-            }
             self.outputs
                 .pop_front()
                 .ok_or_else(|| debug_error("TEST_OUTPUT_MISSING", command))
@@ -1043,14 +1049,9 @@ mod tests {
         start(&mut engine);
         assert_eq!(engine.state(), SessionState::Halted);
         assert_eq!(engine.generation(), 1);
-        assert!(
-            engine
-                .transport
-                .stop_wait_commands
-                .iter()
-                .any(|command| command.contains("monitor reset halt")),
-            "reset-halt must consume its own asynchronous stop record"
-        );
+        assert!(engine.transport.commands.windows(2).any(|commands| {
+            commands[0].contains("monitor reset halt") && commands[1] == "-stack-info-frame"
+        }));
         engine.continue_target().expect("continue");
         assert_eq!(engine.state(), SessionState::Running);
         assert_eq!(engine.step().unwrap_err().code(), "INVALID_SESSION_STATE");
@@ -1073,10 +1074,16 @@ mod tests {
             MiRecord::Target("late target output\n".into()),
             MiRecord::Exec {
                 class: "stopped".into(),
-                results: vec![MiResult {
-                    variable: "reason".into(),
-                    value: MiValue::Const("breakpoint-hit".into()),
-                }],
+                results: vec![
+                    MiResult {
+                        variable: "reason".into(),
+                        value: MiValue::Const("breakpoint-hit".into()),
+                    },
+                    MiResult {
+                        variable: "frame".into(),
+                        value: tuple(&[("level", "0"), ("func", "main"), ("addr", "0x00400100")]),
+                    },
+                ],
             },
         ];
         engine.poll().expect("poll");
@@ -1093,6 +1100,43 @@ mod tests {
             SessionEvent::Stopped { generation: event_generation, reason, .. }
                 if *event_generation == generation && reason == "breakpoint"
         )));
+    }
+
+    #[test]
+    fn stop_without_inline_frame_queries_the_current_frame() {
+        let stop_without_frame = MiCommandOutput {
+            result_class: "done".into(),
+            results: Vec::new(),
+            records: vec![MiRecord::Exec {
+                class: "stopped".into(),
+                results: vec![MiResult {
+                    variable: "reason".into(),
+                    value: MiValue::Const("breakpoint-hit".into()),
+                }],
+            }],
+            stopped_after_command: false,
+        };
+        let mut engine = SessionEngine::new(started_transport(vec![
+            MiCommandOutput {
+                result_class: "running".into(),
+                results: Vec::new(),
+                records: Vec::new(),
+                stopped_after_command: false,
+            },
+            stop_without_frame,
+            frame_output(),
+        ]));
+        start(&mut engine);
+        engine.continue_target().expect("continue");
+        let frame = engine
+            .wait_until_stopped()
+            .expect("stop")
+            .expect("queried frame");
+        assert_eq!(frame.function, "main");
+        assert_eq!(
+            engine.transport.commands.last().map(String::as_str),
+            Some("-stack-info-frame")
+        );
     }
 
     #[test]
