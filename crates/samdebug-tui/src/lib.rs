@@ -15,6 +15,7 @@ use std::{
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -375,11 +376,7 @@ fn run_loop(
         if cancellation.is_cancelled() {
             session.cancellation_controller().cancel();
             app.process_events(session.take_events());
-            return Err(SamdebugError::new(
-                ErrorCategory::Interrupted,
-                "INTERRUPTED",
-                "debug session interrupted",
-            ));
+            return Err(interrupted_error());
         }
         terminal
             .draw(|frame| render(frame, &app))
@@ -387,6 +384,11 @@ fn run_loop(
         if event::poll(Duration::from_millis(50)).map_err(terminal_error)?
             && let Event::Key(key) = event::read().map_err(terminal_error)?
         {
+            if is_ctrl_c(&key) {
+                session.cancellation_controller().cancel();
+                app.process_events(session.take_events());
+                return Err(interrupted_error());
+            }
             app.handle_key(key, session);
         }
         let stopped = app.process_events(session.take_events());
@@ -398,6 +400,20 @@ fn run_loop(
         }
     }
     Ok(())
+}
+
+fn is_ctrl_c(key: &KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c' | 'C'))
+}
+
+fn interrupted_error() -> SamdebugError {
+    SamdebugError::new(
+        ErrorCategory::Interrupted,
+        "INTERRUPTED",
+        "debug session interrupted",
+    )
 }
 
 trait TerminalRestorer: std::fmt::Debug {
@@ -897,6 +913,19 @@ mod tests {
         );
         assert!(result.is_err());
         assert_eq!(restores.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn ctrl_c_is_reserved_for_interrupt_and_plain_c_is_not() {
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let ctrl_shift_c = KeyEvent::new(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        let plain_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(is_ctrl_c(&ctrl_c));
+        assert!(is_ctrl_c(&ctrl_shift_c));
+        assert!(!is_ctrl_c(&plain_c));
     }
 
     #[test]
