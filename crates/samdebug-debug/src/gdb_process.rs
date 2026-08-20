@@ -39,6 +39,7 @@ pub struct GdbMiProcess {
     readers: Vec<JoinHandle<()>>,
     token: u64,
     stopped: bool,
+    activity: Arc<Mutex<Option<String>>>,
 }
 
 impl GdbMiProcess {
@@ -89,6 +90,7 @@ impl GdbMiProcess {
             readers: vec![stdout_reader, stderr_reader],
             token: 0,
             stopped: false,
+            activity: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -141,6 +143,11 @@ impl GdbMiProcess {
         Arc::clone(&self.child)
     }
 
+    #[must_use]
+    pub(crate) fn activity_handle(&self) -> Arc<Mutex<Option<String>>> {
+        Arc::clone(&self.activity)
+    }
+
     fn drain_pending(&self) -> SamdebugResult<Vec<MiRecord>> {
         let mut records = Vec::new();
         loop {
@@ -191,6 +198,7 @@ impl DebuggerTransport for GdbMiProcess {
             .ok_or_else(|| debug_error("GDB_TOKEN_EXHAUSTED", "GDB/MI command token exhausted"))?;
         let token = self.token;
         self.write_command(token, command)?;
+        let _activity = CommandActivity::start(Arc::clone(&self.activity), command);
         let deadline = Instant::now() + timeout;
         let mut result = None;
         let mut stopped = !wait_for_stop;
@@ -304,6 +312,23 @@ impl DebuggerTransport for GdbMiProcess {
 
     fn poll_records(&mut self) -> SamdebugResult<Vec<MiRecord>> {
         self.drain_pending()
+    }
+}
+
+struct CommandActivity {
+    activity: Arc<Mutex<Option<String>>>,
+}
+
+impl CommandActivity {
+    fn start(activity: Arc<Mutex<Option<String>>>, command: &str) -> Self {
+        *activity.lock().expect("GDB activity mutex poisoned") = Some(command.to_owned());
+        Self { activity }
+    }
+}
+
+impl Drop for CommandActivity {
+    fn drop(&mut self) {
+        *self.activity.lock().expect("GDB activity mutex poisoned") = None;
     }
 }
 

@@ -1,4 +1,8 @@
-use std::{path::PathBuf, thread, time::Duration};
+use std::{
+    path::PathBuf,
+    thread,
+    time::{Duration, Instant},
+};
 
 use samdebug_core::{CancellationToken, ErrorCategory};
 use samdebug_debug::{
@@ -143,13 +147,23 @@ fn physical_gdb_mi_cancels_firmware_load_reaps_and_releases_probe() {
     .expect("launch debug session");
     let controller = session.cancellation_controller();
     let canceller = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(1));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if controller.active_command().as_deref() == Some("-target-download") {
+                controller.cancel();
+                return true;
+            }
+            thread::sleep(Duration::from_micros(100));
+        }
         controller.cancel();
+        false
     });
-    let error = session
-        .load_firmware(&format!("firmware.load:{serial}"))
-        .expect_err("firmware load must be cancelled");
-    canceller.join().expect("canceller");
+    let load_result = session.load_firmware(&format!("firmware.load:{serial}"));
+    assert!(
+        canceller.join().expect("canceller"),
+        "cancellation must observe -target-download actively in flight"
+    );
+    let error = load_result.expect_err("firmware load must be cancelled");
     assert_eq!(error.category(), ErrorCategory::Interrupted);
     assert_eq!(error.exit_code(), 130);
     assert_eq!(session.state(), SessionState::Idle);

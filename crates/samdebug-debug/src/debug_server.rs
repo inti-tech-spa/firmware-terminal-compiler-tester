@@ -132,6 +132,9 @@ impl OpenOcdDebugServer {
     ) -> SamdebugResult<()> {
         let deadline = Instant::now() + timeout;
         loop {
+            if let Some(error) = self.diagnosed_connection_failure() {
+                return Err(error);
+            }
             if cancellation.is_cancelled() {
                 return Err(SamdebugError::new(
                     ErrorCategory::Interrupted,
@@ -328,13 +331,15 @@ fn spawn_log_reader(
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         for line in BufReader::new(stream).lines().map_while(Result::ok) {
-            if is_probe_disconnect(&line) || is_target_connection_loss(&line) {
-                cancellation.cancel();
-            }
+            let fatal_transport = is_probe_disconnect(&line) || is_target_connection_loss(&line);
             let mut log = log.lock().expect("OpenOCD log mutex poisoned");
             if log.len() < 1024 * 1024 {
                 log.push_str(&line);
                 log.push('\n');
+            }
+            drop(log);
+            if fatal_transport {
+                cancellation.cancel();
             }
         }
     })

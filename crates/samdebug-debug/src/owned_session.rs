@@ -19,12 +19,21 @@ static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 pub struct DebugCancellationController {
     token: CancellationToken,
     requested: Arc<AtomicBool>,
+    activity: Arc<Mutex<Option<String>>>,
 }
 
 impl DebugCancellationController {
     pub fn cancel(&self) {
         self.requested.store(true, Ordering::SeqCst);
         self.token.cancel();
+    }
+
+    #[must_use]
+    pub fn active_command(&self) -> Option<String> {
+        self.activity
+            .lock()
+            .expect("GDB activity mutex poisoned")
+            .clone()
     }
 }
 
@@ -43,6 +52,8 @@ pub struct OwnedDebugSession {
     cancellation: CancellationToken,
     supervisor: Option<JoinHandle<()>>,
     user_cancel_requested: Arc<AtomicBool>,
+    activity: Arc<Mutex<Option<String>>>,
+    supervisor_failure: Arc<Mutex<Option<SamdebugError>>>,
 }
 
 impl OwnedDebugSession {
@@ -138,8 +149,10 @@ impl OwnedDebugSession {
             record_event(&mut pending_events, event_sink, event);
         }
         if cancellation.is_cancelled() {
+            let error = interrupted();
+            emit_startup_failure(event_sink, generation, SessionState::GdbStarting, &error);
             let _ = server.stop();
-            return Err(interrupted());
+            return Err(error);
         }
         let process = match GdbMiProcess::launch_cancellable(gdb, cancellation) {
             Ok(process) => process,
@@ -149,10 +162,13 @@ impl OwnedDebugSession {
                 return Err(error);
             }
         };
+        let activity = process.activity_handle();
+        let supervisor_failure = Arc::new(Mutex::new(None));
         let supervisor = spawn_supervisor(
             process.child_handle(),
             server.child_handle(),
             cancellation.clone(),
+            Arc::clone(&supervisor_failure),
         );
         let mut engine =
             SessionEngine::with_started_lifecycle(process, cancellation.clone(), generation);
@@ -177,6 +193,8 @@ impl OwnedDebugSession {
             cancellation: cancellation.clone(),
             supervisor: Some(supervisor),
             user_cancel_requested: Arc::new(AtomicBool::new(false)),
+            activity,
+            supervisor_failure,
         })
     }
 
@@ -214,6 +232,7 @@ impl OwnedDebugSession {
         DebugCancellationController {
             token: self.cancellation.clone(),
             requested: Arc::clone(&self.user_cancel_requested),
+            activity: Arc::clone(&self.activity),
         }
     }
 
@@ -328,12 +347,14 @@ impl OwnedDebugSession {
                     error
                 } else {
                     let failure = self.server.diagnosed_connection_failure().unwrap_or_else(|| {
-                        self.server.check_alive().err().unwrap_or_else(|| {
-                            SamdebugError::new(
-                                ErrorCategory::Debugger,
-                                "DEBUG_TRANSPORT_FAILED",
-                                "debugger supervision interrupted the operation after a child or transport failure",
-                            )
+                        self.supervisor_failure().unwrap_or_else(|| {
+                            self.server.check_alive().err().unwrap_or_else(|| {
+                                SamdebugError::new(
+                                    ErrorCategory::Debugger,
+                                    "DEBUG_TRANSPORT_FAILED",
+                                    "debugger supervision interrupted the operation after a child or transport failure",
+                                )
+                            })
                         })
                     });
                     self.engine.fail_and_cleanup(&failure);
@@ -370,12 +391,14 @@ impl OwnedDebugSession {
                 .server
                 .diagnosed_connection_failure()
                 .unwrap_or_else(|| {
-                    self.server.check_alive().err().unwrap_or_else(|| {
-                        SamdebugError::new(
-                            ErrorCategory::Debugger,
-                            "DEBUG_TRANSPORT_FAILED",
-                            "a supervised debugger child or transport failed",
-                        )
+                    self.supervisor_failure().unwrap_or_else(|| {
+                        self.server.check_alive().err().unwrap_or_else(|| {
+                            SamdebugError::new(
+                                ErrorCategory::Debugger,
+                                "DEBUG_TRANSPORT_FAILED",
+                                "a supervised debugger child or transport failed",
+                            )
+                        })
                     })
                 });
             self.engine.fail_and_cleanup(&cause);
@@ -396,6 +419,13 @@ impl OwnedDebugSession {
 
     fn synchronize_transport(&mut self) {
         let _ = self.poll_transport();
+    }
+
+    fn supervisor_failure(&self) -> Option<SamdebugError> {
+        self.supervisor_failure
+            .lock()
+            .expect("supervisor failure mutex poisoned")
+            .clone()
     }
 }
 
@@ -579,6 +609,7 @@ fn spawn_supervisor(
     gdb: Arc<Mutex<Child>>,
     openocd: Arc<Mutex<Child>>,
     cancellation: CancellationToken,
+    failure: Arc<Mutex<Option<SamdebugError>>>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         loop {
@@ -590,6 +621,20 @@ fn spawn_supervisor(
             let gdb_exited = child_exited(&gdb);
             let openocd_exited = child_exited(&openocd);
             if gdb_exited || openocd_exited {
+                let cause = if gdb_exited {
+                    SamdebugError::new(
+                        ErrorCategory::Debugger,
+                        "GDB_EXITED",
+                        "GDB exited while the debug session was active",
+                    )
+                } else {
+                    SamdebugError::new(
+                        ErrorCategory::Connection,
+                        "OPENOCD_EXITED",
+                        "OpenOCD exited while the debug session was active",
+                    )
+                };
+                *failure.lock().expect("supervisor failure mutex poisoned") = Some(cause);
                 cancellation.cancel();
                 terminate_and_reap(&gdb);
                 terminate_and_reap(&openocd);
@@ -693,8 +738,12 @@ mod tests {
         let cancellation = CancellationToken::new();
         let gdb = spawn_group("/bin/sleep 30");
         let openocd = spawn_group("/bin/sleep 30");
-        let supervisor =
-            spawn_supervisor(Arc::clone(&gdb), Arc::clone(&openocd), cancellation.clone());
+        let supervisor = spawn_supervisor(
+            Arc::clone(&gdb),
+            Arc::clone(&openocd),
+            cancellation.clone(),
+            Arc::new(Mutex::new(None)),
+        );
         cancellation.cancel();
         supervisor.join().expect("supervisor");
         assert!(child_exited(&gdb));
@@ -708,8 +757,12 @@ mod tests {
             descendant_file.display()
         ));
         let openocd = spawn_group("/bin/sleep 30");
-        let supervisor =
-            spawn_supervisor(Arc::clone(&gdb), Arc::clone(&openocd), cancellation.clone());
+        let supervisor = spawn_supervisor(
+            Arc::clone(&gdb),
+            Arc::clone(&openocd),
+            cancellation.clone(),
+            Arc::new(Mutex::new(None)),
+        );
         let deadline = Instant::now() + Duration::from_secs(2);
         while !descendant_file.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
@@ -726,10 +779,23 @@ mod tests {
         let cancellation = CancellationToken::new();
         let gdb = spawn_group("exit 0");
         let openocd = spawn_group("/bin/sleep 30");
-        let supervisor =
-            spawn_supervisor(Arc::clone(&gdb), Arc::clone(&openocd), cancellation.clone());
+        let failure = Arc::new(Mutex::new(None));
+        let supervisor = spawn_supervisor(
+            Arc::clone(&gdb),
+            Arc::clone(&openocd),
+            cancellation.clone(),
+            Arc::clone(&failure),
+        );
         supervisor.join().expect("supervisor");
         assert!(cancellation.is_cancelled());
+        assert_eq!(
+            failure
+                .lock()
+                .expect("failure")
+                .as_ref()
+                .map(SamdebugError::code),
+            Some("GDB_EXITED")
+        );
         assert!(child_exited(&gdb));
         assert!(child_exited(&openocd));
     }
