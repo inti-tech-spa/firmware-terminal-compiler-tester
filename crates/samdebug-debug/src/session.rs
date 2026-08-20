@@ -713,7 +713,7 @@ impl<T: DebuggerTransport> SessionEngine<T> {
                 "-interpreter-exec console {}",
                 mi_quote("monitor reset halt")
             ),
-            false,
+            true,
         )?;
         let output = self.run_done("-stack-info-frame", false)?;
         if result(&output.results, "frame")
@@ -913,6 +913,7 @@ mod tests {
     #[derive(Debug)]
     struct FakeTransport {
         commands: Vec<String>,
+        stop_wait_commands: Vec<String>,
         outputs: VecDeque<MiCommandOutput>,
         pending_records: Vec<MiRecord>,
         shutdowns: usize,
@@ -922,6 +923,7 @@ mod tests {
         fn scripted(outputs: Vec<MiCommandOutput>) -> Self {
             Self {
                 commands: Vec::new(),
+                stop_wait_commands: Vec::new(),
                 outputs: outputs.into(),
                 pending_records: Vec::new(),
                 shutdowns: 0,
@@ -933,7 +935,7 @@ mod tests {
         fn command(
             &mut self,
             command: &str,
-            _wait_for_stop: bool,
+            wait_for_stop: bool,
             _timeout: Duration,
             cancellation: &CancellationToken,
         ) -> SamdebugResult<MiCommandOutput> {
@@ -945,6 +947,9 @@ mod tests {
                 ));
             }
             self.commands.push(command.to_owned());
+            if wait_for_stop {
+                self.stop_wait_commands.push(command.to_owned());
+            }
             self.outputs
                 .pop_front()
                 .ok_or_else(|| debug_error("TEST_OUTPUT_MISSING", command))
@@ -1038,6 +1043,14 @@ mod tests {
         start(&mut engine);
         assert_eq!(engine.state(), SessionState::Halted);
         assert_eq!(engine.generation(), 1);
+        assert!(
+            engine
+                .transport
+                .stop_wait_commands
+                .iter()
+                .any(|command| command.contains("monitor reset halt")),
+            "reset-halt must consume its own asynchronous stop record"
+        );
         engine.continue_target().expect("continue");
         assert_eq!(engine.state(), SessionState::Running);
         assert_eq!(engine.step().unwrap_err().code(), "INVALID_SESSION_STATE");
