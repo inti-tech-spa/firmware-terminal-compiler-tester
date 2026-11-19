@@ -1,0 +1,28 @@
+name: Release promotion
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+
+permissions: {}
+
+jobs:
+  promotion-source:
+    name: Release promotion source
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify that the release comes from this repository's develop branch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
+              event = json.load(event_file)
+          head = event["pull_request"]["head"]
+          source = (head.get("repo") or {}).get("full_name")
+          if head["ref"] != "develop" or source != os.environ["GITHUB_REPOSITORY"]:
+              raise SystemExit("Open release promotion pull requests from this repository's develop branch.")
+          PY

@@ -18,3 +18,7 @@ report is committed under `docs/audits/`.
 M0 through M6 are independently approved. M7 integrates the native TUI, NDJSON
 agent protocol, and Apple Silicon release packaging and is undergoing its final
 implementation and audit gate. See `docs/debugging.md` and `docs/release.md`.
+
+## Branches and releases
+
+Start feature work from `develop`, merge and test there, then promote the verified revision to `master` for release. Both promotion steps use merge commits. Delete feature branches after integration testing passes and keep `develop`. See [the branch and release workflow](AGENTS.md#branch-and-release-workflow) for approvals, test records, and release tags.
